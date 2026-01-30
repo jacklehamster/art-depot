@@ -1,4 +1,4 @@
-name = "cloudflare-worker"
+name = "art-depot"
 compatibility_date = "2026-01-26"
 main = "src/index.ts"
 compatibility_flags = ["nodejs_compat"]
@@ -11,3 +11,32 @@ binding = "ASSETS"
 enabled = true
 persist = true
 invocation_logs = true
+
+kv_namespaces = [
+  { binding = "HOT", id = "YOUR_KV_NAMESPACE_ID" }
+]
+
+r2_buckets = [
+  { binding = "STAGING", bucket_name = "staging-assets" }
+]
+
+[[queues.producers]]
+binding = "PERSIST_Q"
+queue = "persist-to-drive"
+
+[[queues.consumers]]
+queue = "persist-to-drive"
+max_batch_size = 10
+max_batch_timeout = 5
+
+[vars]
+R2_ACCOUNT_ID = "1fe1ef92444f52ef8d7ff09c175d034e"
+R2_BUCKET = "art-depot"
+
+# S3-compatible credentials for presigning (create an R2 API token/key)
+# R2_ACCESS_KEY_ID
+# R2_SECRET_ACCESS_KEY
+
+# Google OAuth client (for refresh token -> access token)
+# GOOGLE_CLIENT_ID = "..."
+# GOOGLE_CLIENT_SECRET = "..."
