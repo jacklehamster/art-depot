@@ -142,6 +142,32 @@
         return JSON.parse(txt);
       }
 
+      async function convertImage(file) {
+        const img = await createImageBitmap(file);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+
+        // Try AVIF, fall back to WebP
+        const avif = await new Promise((res) =>
+          canvas.toBlob((b) => res(b), "image/avif", 0.75),
+        );
+        if (avif) return { blob: avif, mime: "image/avif" };
+
+        const webp =
+          (await new Promise()) <
+          Blob >
+          ((res, rej) =>
+            canvas.toBlob(
+              (b) => (b ? res(b) : rej(new Error("webp failed"))),
+              "image/webp",
+              0.8,
+            ));
+        return { blob: webp, mime: "image/webp" };
+      }
+
       $("btn").onclick = async () => {
         $("btn").disabled = true;
         $("prog").value = 0;
@@ -149,53 +175,56 @@
         $("log").textContent = "";
         $("out").innerHTML = "";
 
-        try {
-          const file = $("file").files?.[0];
-          if (!file) throw new Error("Pick a file first.");
+        // try {
+        let file = $("file").files?.[0];
+        if (!file) throw new Error("Pick a file first.");
 
-          const userId = $("userId").value || "anon";
-          const sha256 = await sha256Hex(file);
+        const compressed = await convertImage(file);
+        file = compressed.blob;
 
-          $("status").textContent = "Requesting upload URL…";
-          log("sha256: " + sha256);
+        const userId = $("userId").value || "anon";
+        const sha256 = await sha256Hex(file);
 
-          const init = await postJson("/upload-url", {
-            userId,
-            sha256,
-            mime: file.type || "application/octet-stream",
-            bytes: file.size,
-          });
+        $("status").textContent = "Requesting upload URL…";
+        log("sha256: " + sha256);
 
-          $("assetId").textContent = init.assetId;
-          $("r2Key").textContent = init.r2Key;
+        const init = await postJson("/upload-url", {
+          userId,
+          sha256,
+          mime: file.type || "application/octet-stream",
+          bytes: file.size,
+        });
 
-          $("status").textContent = "Uploading to R2…";
-          await putWithProgress(init.putUrl, file, (pct, loaded, total) => {
-            $("prog").value = pct;
-            $("status").textContent = `Uploading… ${pct}% (${loaded}/${total})`;
-          });
+        $("assetId").textContent = init.assetId;
+        $("r2Key").textContent = init.r2Key;
 
-          $("status").textContent = "Committing…";
-          await postJson("/commit", {
-            assetId: init.assetId,
-            r2Key: init.r2Key,
-            mime: file.type || "application/octet-stream",
-            bytes: file.size,
-          });
+        $("status").textContent = "Uploading to R2…";
+        await putWithProgress(init.putUrl, file, (pct, loaded, total) => {
+          $("prog").value = pct;
+          $("status").textContent = `Uploading… ${pct}% (${loaded}/${total})`;
+        });
 
-          $("status").textContent = "Done ✅";
-          const link = `/a/${encodeURIComponent(init.assetId)}`;
-          $("out").innerHTML = `
+        $("status").textContent = "Committing…";
+        await postJson("/commit", {
+          assetId: init.assetId,
+          r2Key: init.r2Key,
+          mime: file.type || "application/octet-stream",
+          bytes: file.size,
+        });
+
+        $("status").textContent = "Done ✅";
+        const link = `/a/${encodeURIComponent(init.assetId)}`;
+        $("out").innerHTML = `
         <p><b>Fetch:</b> <a href="${link}" target="_blank" rel="noopener">${link}</a></p>
       `;
-          log("OK: " + link);
-        } catch (e) {
-          $("status").textContent = "Error ❌";
-          log(String(e?.message || e));
-        } finally {
-          $("btn").disabled = false;
-        }
+        log("OK: " + link);
+        // } catch (e) {
+        //   $("status").textContent = "Error ❌";
+        //   log(String(e?.message || e));
+        // } finally {
+        $("btn").disabled = false;
       };
+      // };
     </script>
   </body>
 </html>

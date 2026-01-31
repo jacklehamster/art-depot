@@ -161,14 +161,6 @@ export default {
       });
     }
 
-    console.log("bindings:", {
-      HOT: !!env.HOT,
-      STAGING: !!env.STAGING,
-      R2_ACCOUNT_ID: env.R2_ACCOUNT_ID,
-      R2_BUCKET: env.R2_BUCKET,
-      R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID ? "set" : "MISSING",
-    });
-
     // ---- API routes ----
     if (url.pathname === "/upload-url" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
