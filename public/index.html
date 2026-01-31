@@ -142,32 +142,6 @@
         return JSON.parse(txt);
       }
 
-      async function convertImage(file) {
-        const img = await createImageBitmap(file);
-        const canvas = document.createElement("canvas");
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0);
-
-        // Try AVIF, fall back to WebP
-        const avif = await new Promise((res) =>
-          canvas.toBlob((b) => res(b), "image/avif", 0.75),
-        );
-        if (avif) return { blob: avif, mime: "image/avif" };
-
-        const webp =
-          (await new Promise()) <
-          Blob >
-          ((res, rej) =>
-            canvas.toBlob(
-              (b) => (b ? res(b) : rej(new Error("webp failed"))),
-              "image/webp",
-              0.8,
-            ));
-        return { blob: webp, mime: "image/webp" };
-      }
-
       $("btn").onclick = async () => {
         $("btn").disabled = true;
         $("prog").value = 0;
@@ -178,9 +152,6 @@
         // try {
         let file = $("file").files?.[0];
         if (!file) throw new Error("Pick a file first.");
-
-        const compressed = await convertImage(file);
-        file = compressed.blob;
 
         const userId = $("userId").value || "anon";
         const sha256 = await sha256Hex(file);
@@ -214,8 +185,9 @@
 
         $("status").textContent = "Done ✅";
         const link = `/a/${encodeURIComponent(init.assetId)}`;
+        const compressedLink = `https://img.dobuki.net/?url=${encodeURIComponent(link)}`;
         $("out").innerHTML = `
-        <p><b>Fetch:</b> <a href="${link}" target="_blank" rel="noopener">${link}</a></p>
+        <p><b>Fetch:</b> <a href="${link}" target="_blank" rel="noopener">${link}</a><br><a href="${compressedLink}" target="_blank" rel="noopener">compressed</a></p>
       `;
         log("OK: " + link);
         // } catch (e) {
