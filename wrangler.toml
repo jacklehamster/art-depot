@@ -3,31 +3,17 @@ compatibility_date = "2026-01-26"
 main = "src/index.ts"
 compatibility_flags = ["nodejs_compat"]
 
-[assets]
-directory = "./public"
-binding = "ASSETS"
-
-[observability.logs]
-enabled = true
-persist = true
-invocation_logs = true
-
 kv_namespaces = [
-  { binding = "HOT", id = "YOUR_KV_NAMESPACE_ID" }
+  { binding = "HOT", id = "179246beba4d46f0b42be535f23fa306", preview_id = "ed5f400faf294b19ac6f1b05a20807cc", remote = true }
 ]
 
 r2_buckets = [
-  { binding = "STAGING", bucket_name = "staging-assets" }
+  { binding = "STAGING", bucket_name = "art-depot", preview_bucket_name = "art-depot-preview", remote = true }
 ]
 
-[[queues.producers]]
-binding = "PERSIST_Q"
-queue = "persist-to-drive"
-
-[[queues.consumers]]
-queue = "persist-to-drive"
-max_batch_size = 10
-max_batch_timeout = 5
+[assets]
+directory = "./public"
+binding = "ASSETS"
 
 [vars]
 R2_ACCOUNT_ID = "1fe1ef92444f52ef8d7ff09c175d034e"
@@ -40,3 +26,9 @@ R2_BUCKET = "art-depot"
 # Google OAuth client (for refresh token -> access token)
 # GOOGLE_CLIENT_ID = "..."
 # GOOGLE_CLIENT_SECRET = "..."
+
+[observability.logs]
+enabled = true
+persist = true
+invocation_logs = true
+
