@@ -185,7 +185,7 @@
 
         $("status").textContent = "Done ✅";
         const link = `/a/${encodeURIComponent(init.assetId)}`;
-        const compressedLink = `https://img.dobuki.net/?url=${location.origin}${link}`;
+        const compressedLink = `https://img.dobuki.net?url=${location.origin}${link}`;
         $("out").innerHTML = `
         <p><b>Fetch:</b> <a href="${link}" target="_blank" rel="noopener">${link}</a><br><a href="${compressedLink}" target="_blank" rel="noopener">compressed</a></p>
       `;
