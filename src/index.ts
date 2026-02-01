@@ -7,8 +7,10 @@
  *   4) GET  /a/:assetId  -> serves converted object
  */
 
-import * as avif from "@jsquash/avif";
-import * as webp from "@jsquash/webp";
+import { encode as avifEncode } from "@jsquash/avif";
+import { encode as webpEncode, decode as webpDecode } from "@jsquash/webp";
+import { decode as jpegDecode } from "@jsquash/jpeg";
+import { decode as pngDecode } from "@jsquash/png";
 
 export interface Env {
   // Storage
@@ -51,7 +53,6 @@ function json(data: unknown, status = 200) {
 }
 
 function isApiRoute(pathname: string) {
-  // Keep static assets clean by reserving these
   return (
     pathname === "/upload-url" ||
     pathname === "/commit" ||
@@ -92,8 +93,8 @@ async function sha256Hex(s: string) {
     .join("");
 }
 
-async function sha256HexBytes(buf: ArrayBufferLike) {
-  const digest = await crypto.subtle.digest("SHA-256", buf as ArrayBuffer);
+async function sha256HexBytes(buf: ArrayBuffer) {
+  const digest = await crypto.subtle.digest("SHA-256", buf);
   return [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -163,58 +164,67 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
 }
 
 // -----------------------------
-// jsquash init + encode wrappers
+// Decode: R2 object -> ImageData
+// Prefer jSquash WASM decoders (reliable in Workers) over createImageBitmap.
 // -----------------------------
-let avifReady: Promise<void> | null = null;
-let webpReady: Promise<void> | null = null;
-
-function ensureAvifReady() {
-  avifReady ??= (avif as any).init?.() ?? Promise.resolve();
-  return avifReady;
-}
-
-function ensureWebpReady() {
-  webpReady ??= (webp as any).init?.() ?? Promise.resolve();
-  return webpReady;
-}
-
 async function r2ObjectToImageData(obj: R2ObjectBody): Promise<ImageData> {
   const ab = await obj.arrayBuffer();
+
+  // Prefer R2 httpMetadata.contentType; fall back to headers if needed.
   const contentType =
-    obj.httpMetadata?.contentType || "application/octet-stream";
+    obj.httpMetadata?.contentType ||
+    (obj as any).headers?.get?.("content-type") ||
+    "application/octet-stream";
 
-  const blob = new Blob([ab], { type: contentType });
+  const ct = contentType.toLowerCase();
 
-  let bmp: ImageBitmap;
   try {
-    bmp = await createImageBitmap(blob);
-  } catch {
-    throw new Error(
-      `Unsupported input for conversion: ${contentType}. Try JPEG/PNG/WebP.`,
-    );
+    if (ct.includes("image/jpeg") || ct.includes("image/jpg")) {
+      return await jpegDecode(ab);
+    }
+    if (ct.includes("image/png")) {
+      return await pngDecode(ab);
+    }
+    if (ct.includes("image/webp")) {
+      return await webpDecode(ab);
+    }
+  } catch (e) {
+    // Fall through to createImageBitmap fallback below with the real error captured.
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn("WASM decode failed, falling back to createImageBitmap:", msg);
   }
 
-  const canvas = new OffscreenCanvas(bmp.width, bmp.height);
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Failed to get 2d context");
-  ctx.drawImage(bmp, 0, 0);
-  bmp.close();
+  // Fallback: Canvas decode (may be unsupported in some Workers configs)
+  try {
+    const blob = new Blob([ab], { type: contentType });
+    const bmp = await createImageBitmap(blob);
 
-  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Failed to get 2d context");
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`Decode failed for content-type "${contentType}": ${msg}`);
+  }
 }
 
+// -----------------------------
+// Encode: ImageData -> AVIF/WEBP
+// -----------------------------
 async function encodeImage(
   imageData: ImageData,
   format: OutputFormat,
 ): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
   if (format === "webp") {
-    await ensureWebpReady();
-    const ab = await (webp as any).encode(imageData, { quality: 80 });
+    const ab = await webpEncode(imageData, { quality: 80 } as any);
     return { bytes: new Uint8Array(ab), mime: "image/webp", ext: "webp" };
   }
 
-  await ensureAvifReady();
-  const ab = await (avif as any).encode(imageData, { quality: 45 });
+  const ab = await avifEncode(imageData, { quality: 45 } as any);
   return { bytes: new Uint8Array(ab), mime: "image/avif", ext: "avif" };
 }
 
@@ -234,7 +244,6 @@ export default {
   ): Promise<Response> {
     const url = new URL(req.url);
 
-    // Serve a simple API descriptor
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
         ok: true,
@@ -246,8 +255,6 @@ export default {
         ],
       });
     }
-
-    // ---- API routes ----
 
     // 1) Presign URL for browser PUT to R2 (original bytes)
     if (url.pathname === "/upload-url" && req.method === "POST") {
@@ -346,7 +353,7 @@ export default {
       }
 
       // Store converted object (dedupe by hash of encoded bytes)
-      const outHash = await sha256HexBytes(outBytes.buffer);
+      const outHash = await sha256HexBytes(outBytes.buffer as ArrayBuffer);
       const convertedKey = `staging/converted/${outHash}.${outExt}`;
 
       await env.STAGING.put(convertedKey, outBytes, {
