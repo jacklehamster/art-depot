@@ -1,12 +1,12 @@
+import { encode as encodeAvif } from "@jsquash/avif";
+import { encode as encodeWebp } from "@jsquash/webp";
+
 export interface Env {
-  // Storage
   HOT: KVNamespace;
   STAGING: R2Bucket;
-
-  // Static assets binding (Workers Static Assets)
   ASSETS: Fetcher;
 
-  // R2 presign config
+  // (kept in case you still want presign for other things)
   R2_ACCOUNT_ID: string;
   R2_BUCKET: string;
   R2_ACCESS_KEY_ID: string;
@@ -22,99 +22,11 @@ function json(data: unknown, status = 200) {
   });
 }
 
-function awsDates(d = new Date()) {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const y = d.getUTCFullYear();
-  const m = pad(d.getUTCMonth() + 1);
-  const day = pad(d.getUTCDate());
-  const hh = pad(d.getUTCHours());
-  const mm = pad(d.getUTCMinutes());
-  const ss = pad(d.getUTCSeconds());
-  const dateStamp = `${y}${m}${day}`;
-  const amzDate = `${dateStamp}T${hh}${mm}${ss}Z`;
-  return { dateStamp, amzDate };
-}
-
-async function hmacSha256(key: ArrayBuffer, msg: string) {
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    key,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(msg));
-  return new Uint8Array(sig);
-}
-
-async function sha256Hex(s: string) {
-  const digest = await crypto.subtle.digest("SHA-256", enc.encode(s));
+async function sha256HexBytes(buf: ArrayBuffer) {
+  const digest = await crypto.subtle.digest("SHA-256", buf);
   return [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-}
-
-/**
- * Presigned PUT URL for R2 (S3 SigV4).
- * Signs only `host`, uses UNSIGNED-PAYLOAD (browser can set Content-Type freely).
- */
-async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
-  const { dateStamp, amzDate } = awsDates();
-  const region = "auto";
-  const service = "s3";
-  const host = `${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-
-  const canonicalUri = `/${env.R2_BUCKET}/${encodeURIComponent(key).replace(/%2F/g, "/")}`;
-  const algorithm = "AWS4-HMAC-SHA256";
-  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
-  const credential = `${env.R2_ACCESS_KEY_ID}/${credentialScope}`;
-  const signedHeaders = "host";
-
-  const params: Record<string, string> = {
-    "X-Amz-Algorithm": algorithm,
-    "X-Amz-Credential": encodeURIComponent(credential),
-    "X-Amz-Date": amzDate,
-    "X-Amz-Expires": String(expiresSeconds),
-    "X-Amz-SignedHeaders": signedHeaders,
-  };
-
-  const canonicalQuery = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join("&");
-
-  const canonicalHeaders = `host:${host}\n`;
-  const payloadHash = "UNSIGNED-PAYLOAD";
-
-  const canonicalRequest = [
-    "PUT",
-    canonicalUri,
-    canonicalQuery,
-    canonicalHeaders,
-    signedHeaders,
-    payloadHash,
-  ].join("\n");
-
-  const stringToSign = [
-    algorithm,
-    amzDate,
-    credentialScope,
-    await sha256Hex(canonicalRequest),
-  ].join("\n");
-
-  // SigV4 key derivation
-  const kSecret = enc.encode(`AWS4${env.R2_SECRET_ACCESS_KEY}`).buffer;
-  const kDate = (await hmacSha256(kSecret, dateStamp)).buffer;
-  const kRegion = (await hmacSha256(kDate, region)).buffer;
-  const kService = (await hmacSha256(kRegion, service)).buffer;
-  const kSigning = (await hmacSha256(kService, "aws4_request")).buffer;
-
-  const sigBytes = await hmacSha256(kSigning, stringToSign);
-  const signature = [...sigBytes]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
-  return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
 type HotAsset = {
@@ -126,12 +38,10 @@ type HotAsset = {
 };
 
 const HOT_TTL_SECONDS = 12 * 60 * 60; // 12 hours
-const PUT_URL_EXPIRES_SECONDS = 5 * 60;
 
 function isApiRoute(pathname: string) {
-  // Keep static assets clean by reserving these
   return (
-    pathname === "/upload-url" ||
+    pathname === "/upload" ||
     pathname === "/commit" ||
     pathname.startsWith("/a/") ||
     pathname === "/api"
@@ -139,6 +49,109 @@ function isApiRoute(pathname: string) {
 }
 
 async function persistToDrive(_env: Env, _hot: HotAsset) {}
+
+type OutputFormat = "avif" | "webp";
+
+function pickFormat(req: Request): OutputFormat {
+  // Prefer explicit query param, else default to avif
+  const url = new URL(req.url);
+  const f = (url.searchParams.get("format") || "").toLowerCase();
+  if (f === "webp") return "webp";
+  return "avif";
+}
+
+function sanitizeUserId(userId?: string) {
+  return (userId || "anon").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+/**
+ * Decode → encode requires pixels. We can’t reliably decode all formats ourselves in Workers
+ * without pulling in a decoder. The simplest practical approach is:
+ * - If the input is already a browser-decodable image type, use createImageBitmap()
+ * - Then draw to OffscreenCanvas to get raw RGBA
+ *
+ * Works well for PNG/JPEG/WebP (and sometimes GIF first frame).
+ */
+async function fileToRgba(file: File): Promise<{
+  rgba: Uint8ClampedArray;
+  width: number;
+  height: number;
+}> {
+  const ab = await file.arrayBuffer();
+  const blob = new Blob([ab], {
+    type: file.type || "application/octet-stream",
+  });
+
+  let bmp: ImageBitmap;
+  try {
+    bmp = await createImageBitmap(blob);
+  } catch {
+    throw new Error(
+      `Unsupported input type for server-side compression: ${file.type || "unknown"}. ` +
+        `Try uploading JPEG/PNG/WebP.`,
+    );
+  }
+
+  const width = bmp.width;
+  const height = bmp.height;
+
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Failed to get 2d context");
+
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+
+  const imageData = ctx.getImageData(0, 0, width, height);
+  return { rgba: imageData.data, width, height };
+}
+
+async function fileToImageData(file: File): Promise<ImageData> {
+  const ab = await file.arrayBuffer();
+  const blob = new Blob([ab], {
+    type: file.type || "application/octet-stream",
+  });
+
+  let bmp: ImageBitmap;
+  try {
+    bmp = await createImageBitmap(blob);
+  } catch {
+    throw new Error(
+      `Unsupported input type for server-side compression: ${file.type || "unknown"}. ` +
+        `Try JPEG/PNG/WebP.`,
+    );
+  }
+
+  const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Failed to get 2d context");
+
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+async function compressToFormat(
+  file: File,
+  format: OutputFormat,
+): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
+  const imageData = await fileToImageData(file);
+
+  if (format === "webp") {
+    const ab = await encodeWebp(imageData, {
+      quality: 80, // 0-100
+    });
+    return { bytes: new Uint8Array(ab), mime: "image/webp", ext: "webp" };
+  }
+
+  const ab = await encodeAvif(imageData, {
+    quality: 45, // typical range ~20-60
+    // speed: 6, // if supported by your version
+  } as any);
+
+  return { bytes: new Uint8Array(ab), mime: "image/avif", ext: "avif" };
+}
 
 export default {
   async fetch(
@@ -148,48 +161,73 @@ export default {
   ): Promise<Response> {
     const url = new URL(req.url);
 
-    // Serve a simple API descriptor
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
         ok: true,
         routes: [
-          "POST /upload-url",
-          "POST /commit",
+          "POST /upload?format=avif|webp (multipart/form-data: file, optional userId)",
+          "POST /commit (optional legacy)",
           "GET /a/:assetId",
           "Static assets: everything else (via ASSETS binding)",
         ],
       });
     }
 
-    // ---- API routes ----
-    if (url.pathname === "/upload-url" && req.method === "POST") {
-      const body = (await req.json().catch(() => ({}))) as {
-        userId?: string;
-        sha256?: string;
-        mime?: string;
-        bytes?: number;
-      };
+    // NEW: server-side upload + compression + put to R2
+    if (url.pathname === "/upload" && req.method === "POST") {
+      // Expect multipart form-data with:
+      // - file: File
+      // - userId: string (optional)
+      let form: FormData;
+      try {
+        form = await req.formData();
+      } catch {
+        return json({ error: "expected multipart/form-data" }, 400);
+      }
+
+      const file = form.get("file");
+      const userId = (form.get("userId") || "")?.toString() || "anon";
+
+      if (!(file instanceof File)) {
+        return json({ error: "missing form field: file" }, 400);
+      }
+      if (!file.size) return json({ error: "empty file" }, 400);
+
+      const format = pickFormat(req);
+
+      let compressed: { bytes: Uint8Array; mime: string; ext: string };
+      try {
+        compressed = await compressToFormat(file, format);
+      } catch (e) {
+        return json(
+          { error: e instanceof Error ? e.message : "compression failed" },
+          400,
+        );
+      }
 
       const assetId = crypto.randomUUID();
-      const mime = body.mime || "application/octet-stream";
-      const bytes = body.bytes || 0;
+      const userPrefix = sanitizeUserId(userId);
 
-      const userPrefix = (body.userId || "anon").replace(
-        /[^a-zA-Z0-9._-]/g,
-        "_",
+      // Use hash of *compressed* bytes so identical outputs dedupe naturally
+      const outHash = await sha256HexBytes(
+        compressed.bytes.buffer as ArrayBuffer,
       );
-      const sha = (body.sha256 ?? "").trim();
-      const fileKey = sha
-        ? `staging/${userPrefix}/${sha}`
-        : `staging/${userPrefix}/${assetId}`;
 
-      const putUrl = await presignR2Put(env, fileKey, PUT_URL_EXPIRES_SECONDS);
+      const r2Key = `staging/${userPrefix}/${outHash}.${compressed.ext}`;
+
+      // Put compressed object to R2
+      await env.STAGING.put(r2Key, compressed.bytes, {
+        httpMetadata: {
+          contentType: compressed.mime,
+          cacheControl: "public, max-age=31536000, immutable",
+        },
+      });
 
       const hot: HotAsset = {
         assetId,
-        r2Key: fileKey,
-        mime,
-        bytes,
+        r2Key,
+        mime: compressed.mime,
+        bytes: compressed.bytes.byteLength,
         createdAt: Date.now(),
       };
 
@@ -197,14 +235,23 @@ export default {
         expirationTtl: HOT_TTL_SECONDS,
       });
 
+      // Optional async persistence hook
+      ctx.waitUntil(
+        persistToDrive(env, hot).catch((e) => {
+          console.error("persistToDrive failed", e);
+        }),
+      );
+
       return json({
         assetId,
-        r2Key: fileKey,
-        putUrl,
-        expiresIn: PUT_URL_EXPIRES_SECONDS,
+        r2Key,
+        mime: hot.mime,
+        bytes: hot.bytes,
+        url: `/a/${assetId}`,
       });
     }
 
+    // Keep your old /commit (optional; can remove if you fully migrate)
     if (url.pathname === "/commit" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         assetId?: string;
@@ -216,12 +263,10 @@ export default {
       if (!body.assetId || !body.r2Key)
         return json({ error: "missing assetId/r2Key" }, 400);
 
-      // Verify object exists
       const head = await env.STAGING.head(body.r2Key);
       if (!head)
         return json({ error: "object not found in R2 (upload failed?)" }, 404);
 
-      // Update HOT KV (as you already do)
       const raw = await env.HOT.get(`asset:${body.assetId}`);
       if (!raw) return json({ error: "assetId not found/expired" }, 404);
 
@@ -233,7 +278,6 @@ export default {
         expirationTtl: HOT_TTL_SECONDS,
       });
 
-      // Fire-and-forget persistence (no paid features)
       ctx.waitUntil(
         persistToDrive(env, hot).catch((e) => {
           console.error("persistToDrive failed", e);
@@ -243,6 +287,7 @@ export default {
       return json({ ok: true, persisted: "scheduled" });
     }
 
+    // Serve stored assets
     {
       const m = url.pathname.match(/^\/a\/(.+)$/);
       if (m && req.method === "GET") {
@@ -256,9 +301,7 @@ export default {
 
         const headers = new Headers();
         headers.set("content-type", hot.mime);
-        // Cache reads for 1 hour at edge
         headers.set("cache-control", "public, max-age=3600");
-
         return new Response(obj.body, {
           headers,
           cf: { cacheEverything: true, cacheTtl: 3600 } as any,
@@ -266,9 +309,7 @@ export default {
       }
     }
 
-    // ---- Static assets fallback ----
-    // Anything not in API space should be served from ASSETS.
-    // (If you prefer Worker-first for all routes, set [assets].run_worker_first=true in wrangler.toml)
+    // Static assets fallback
     if (!isApiRoute(url.pathname)) {
       return env.ASSETS.fetch(req);
     }
