@@ -186,9 +186,22 @@
         $("status").textContent = "Done ✅";
         const link = `/a/${encodeURIComponent(init.assetId)}`;
         const compressedLink = `https://img.dobuki.net?url=${location.origin}${link}`;
-        $("out").innerHTML = `
-        <p><b>Fetch:</b> <a href="${link}" target="_blank" rel="noopener">${link}</a><br><a href="${compressedLink}" target="_blank" rel="noopener">compressed</a></p>
-      `;
+
+        const outDiv = document.querySelector("#out");
+        outDiv.style.display = "flex";
+        outDiv.style.flexDirection = "row";
+        const IMAGES = [link, compressedLink];
+        IMAGES.forEach((url) => {
+          const a = outDiv.appendChild(document.createElement("a"));
+          a.href = url;
+          a.target = "_blank";
+          a.setAttribute("rel", "noopener");
+
+          const img = a.appendChild(document.createElement("img"));
+          img.src = url;
+          img.style.width = "500px";
+        });
+
         log("OK: " + link);
         // } catch (e) {
         //   $("status").textContent = "Error ❌";
