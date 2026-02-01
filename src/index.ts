@@ -1,11 +1,28 @@
 /* eslint-disable no-console */
 
-import avifEncode, { init as initAvifEncode } from "@jsquash/avif/encode";
-import webpEncode, { init as initWebpEncode } from "@jsquash/webp/encode";
+/**
+ * Worker: Presigned PUT upload to R2 + server-side convert on /commit (AVIF/WEBP),
+ * keeping the original client flow:
+ *   1) POST /upload-url  -> {assetId, r2Key, putUrl}
+ *   2) PUT  putUrl       -> upload original bytes to R2
+ *   3) POST /commit      -> server decodes + encodes + updates KV to converted key
+ *   4) GET  /a/:assetId  -> serves converted object
+ *
+ * IMPORTANT:
+ * - This uses the NEW jSquash API shape:
+ *     init(opts?) -> Promise<void>
+ *     default decode(buf) -> Promise<ImageData>
+ *     default encode(imageData) -> Promise<ArrayBuffer>
+ * - In Workers, WASM must be locatable. We provide locateFile to pull wasm from a CDN.
+ * - Set JSQUASH_VERSIONS to match your package.json versions.
+ */
 
-import jpegDecode, { init as initJpegDecode } from "@jsquash/jpeg/decode";
-import pngDecode, { init as initPngDecode } from "@jsquash/png/decode";
-import webpDecode, { init as initWebpDecode } from "@jsquash/webp/decode";
+import jpegDecode, { init as initJpeg } from "@jsquash/jpeg/decode";
+import pngDecode, { init as initPng } from "@jsquash/png/decode";
+import webpDecode, { init as initWebpDec } from "@jsquash/webp/decode";
+
+import avifEncode, { init as initAvifEnc } from "@jsquash/avif/encode";
+import webpEncode, { init as initWebpEnc } from "@jsquash/webp/encode";
 
 export interface Env {
   // Storage
@@ -32,16 +49,82 @@ type HotAsset = {
   createdAt: number;
 };
 
+const enc = new TextEncoder();
+
 const HOT_TTL_SECONDS = 12 * 60 * 60; // 12 hours
 const PUT_URL_EXPIRES_SECONDS = 5 * 60;
 
-const enc = new TextEncoder();
+// -----------------------------
+// jSquash WASM loading (NEW API)
+// -----------------------------
+// ⚠️ Set these to match your installed versions in package.json
+const JSQUASH_VERSIONS = {
+  jpeg: "1.4.0",
+  png: "3.0.1",
+  webp: "1.5.0",
+  avif: "2.1.1",
+} as const;
 
+// You can swap unpkg -> cdn.jsdelivr.net if preferred.
+const JSQUASH_CDN = "https://unpkg.com";
+
+// Emscripten locateFile callback
+function locateFileFor(pkg: string, version: string) {
+  return (path: string, prefix: string) => {
+    const pfx = (prefix || "").replace(/^\.\//, "");
+    const joined = `${pfx}${path}`.replace(/^\.\//, "");
+    return `${JSQUASH_CDN}/${pkg}@${version}/${joined}`;
+  };
+}
+
+let codecsReady: Promise<void> | null = null;
+
+function ensureCodecsReady() {
+  codecsReady ??= (async () => {
+    // Decoders
+    await initJpeg({
+      locateFile: locateFileFor("@jsquash/jpeg", JSQUASH_VERSIONS.jpeg),
+    } as any);
+
+    await initPng({
+      locateFile: locateFileFor("@jsquash/png", JSQUASH_VERSIONS.png),
+    } as any);
+
+    await initWebpDec({
+      locateFile: locateFileFor("@jsquash/webp", JSQUASH_VERSIONS.webp),
+    } as any);
+
+    // Encoders
+    await initAvifEnc({
+      locateFile: locateFileFor("@jsquash/avif", JSQUASH_VERSIONS.avif),
+    } as any);
+
+    await initWebpEnc({
+      locateFile: locateFileFor("@jsquash/webp", JSQUASH_VERSIONS.webp),
+    } as any);
+  })();
+
+  return codecsReady;
+}
+
+// -----------------------------
+// Small utilities
+// -----------------------------
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
+}
+
+function isApiRoute(pathname: string) {
+  // Keep static assets clean by reserving these
+  return (
+    pathname === "/upload-url" ||
+    pathname === "/commit" ||
+    pathname.startsWith("/a/") ||
+    pathname === "/api"
+  );
 }
 
 function awsDates(d = new Date()) {
@@ -83,10 +166,17 @@ async function sha256HexBytes(buf: ArrayBufferLike) {
     .join("");
 }
 
-/**
- * Presigned PUT URL for R2 (S3 SigV4).
- * Signs only `host`, uses UNSIGNED-PAYLOAD (browser can set Content-Type freely).
- */
+function sanitizeUserId(userId?: string) {
+  return (userId || "anon").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function pickFormat(body: any): OutputFormat {
+  return body?.format === "webp" ? "webp" : "avif";
+}
+
+// -----------------------------
+// Presigned PUT URL for R2 (S3 SigV4)
+// -----------------------------
 async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   const { dateStamp, amzDate } = awsDates();
   const region = "auto";
@@ -146,134 +236,33 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-function isApiRoute(pathname: string) {
-  // Keep static assets clean by reserving these
-  return (
-    pathname === "/upload-url" ||
-    pathname === "/commit" ||
-    pathname.startsWith("/a/") ||
-    pathname === "/api"
-  );
-}
-
-async function persistToDrive(_env: Env, _hot: HotAsset) {}
-
-function pickFormatFromBody(body: any): OutputFormat {
-  return body?.format === "webp" ? "webp" : "avif";
-}
-
-/**
- * --- jSquash WASM loading ---
- * We avoid deep-importing *.wasm from node_modules (often breaks with TS/package exports),
- * and instead initialize codecs with locateFile so they can fetch their own WASM.
- *
- * This keeps your server API stable, and fixes JPEG decode failures in Workers.
- */
-const JSQUASH_VERSIONS = {
-  avif: "2.1.1",
-  webp: "1.5.0",
-  jpeg: "1.4.0",
-  png: "3.0.1",
-} as const;
-
-// You can swap unpkg -> cdn.jsdelivr.net if you prefer.
-const CDN = "https://unpkg.com";
-
-function locateFileFor(pkgName: string, version: string) {
-  return (path: string, prefix: string) => {
-    const p = (prefix || "").replace(/^\//, "");
-    const joined = p ? `${p}${path}` : path;
-    return `${CDN}/${pkgName}@${version}/${joined}`;
-  };
-}
-
-let codecsInitPromise: Promise<void> | null = null;
-
-async function ensureCodecsInit() {
-  if (codecsInitPromise) return codecsInitPromise;
-
-  codecsInitPromise = (async () => {
-    // decode
-    await Promise.resolve(
-      initJpegDecode({
-        locateFile: locateFileFor("@jsquash/jpeg", JSQUASH_VERSIONS.jpeg),
-      }),
-    );
-
-    await Promise.resolve(
-      initPngDecode({
-        locateFile: locateFileFor("@jsquash/png", JSQUASH_VERSIONS.png),
-      }),
-    );
-
-    await Promise.resolve(
-      initWebpDecode({
-        locateFile: locateFileFor("@jsquash/webp", JSQUASH_VERSIONS.webp),
-      }),
-    );
-
-    // encode
-    await Promise.resolve(
-      initAvifEncode({
-        locateFile: locateFileFor("@jsquash/avif", JSQUASH_VERSIONS.avif),
-      }),
-    );
-
-    await Promise.resolve(
-      initWebpEncode({
-        locateFile: locateFileFor("@jsquash/webp", JSQUASH_VERSIONS.webp),
-      }),
-    );
-  })();
-
-  return codecsInitPromise;
-}
-
-async function decodeToImageData(
-  ab: ArrayBuffer,
-  mime: string,
-): Promise<ImageData> {
-  await ensureCodecsInit();
-
-  const m = (mime || "").toLowerCase();
-  if (m === "image/jpeg" || m === "image/jpg")
-    return (await jpegDecode(ab)) as any;
-  if (m === "image/png") return (await pngDecode(ab)) as any;
-  if (m === "image/webp") return (await webpDecode(ab)) as any;
-
-  throw new Error(
-    `Unsupported input for conversion: ${mime || "unknown"}. Try JPEG/PNG/WebP.`,
-  );
-}
-
+// -----------------------------
+// Decode + encode helpers
+// -----------------------------
 async function r2ObjectToImageData(obj: R2ObjectBody): Promise<ImageData> {
+  await ensureCodecsReady();
+
   const ab = await obj.arrayBuffer();
   const contentType =
     obj.httpMetadata?.contentType || "application/octet-stream";
+  const ct = contentType.toLowerCase();
 
-  // Try fast path first (if Worker runtime supports decoding that mime)
-  try {
-    const blob = new Blob([ab], { type: contentType });
-    const bmp = await createImageBitmap(blob);
+  // Decode based on MIME. (You can add sniffing if needed.)
+  if (ct.includes("image/jpeg") || ct.includes("image/jpg"))
+    return await jpegDecode(ab);
+  if (ct.includes("image/png")) return await pngDecode(ab);
+  if (ct.includes("image/webp")) return await webpDecode(ab);
 
-    const canvas = new OffscreenCanvas(bmp.width, bmp.height);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Failed to get 2d context");
-    ctx.drawImage(bmp, 0, 0);
-    bmp.close();
-
-    return ctx.getImageData(0, 0, canvas.width, canvas.height);
-  } catch {
-    // Fallback: wasm decoders (fixes JPEG failures in Workers)
-    return decodeToImageData(ab, contentType);
-  }
+  throw new Error(
+    `Unsupported input for conversion: ${contentType}. Try JPEG/PNG/WebP.`,
+  );
 }
 
 async function encodeImage(
   imageData: ImageData,
   format: OutputFormat,
 ): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
-  await ensureCodecsInit();
+  await ensureCodecsReady();
 
   if (format === "webp") {
     const ab = await webpEncode(imageData, { quality: 80 } as any);
@@ -284,6 +273,14 @@ async function encodeImage(
   return { bytes: new Uint8Array(ab), mime: "image/avif", ext: "avif" };
 }
 
+// -----------------------------
+// Placeholder hook
+// -----------------------------
+async function persistToDrive(_env: Env, _hot: HotAsset) {}
+
+// -----------------------------
+// Worker
+// -----------------------------
 export default {
   async fetch(
     req: Request,
@@ -292,21 +289,19 @@ export default {
   ): Promise<Response> {
     const url = new URL(req.url);
 
-    // Serve a simple API descriptor
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
         ok: true,
         routes: [
           "POST /upload-url",
-          "POST /commit",
+          "POST /commit (optional format: avif|webp)",
           "GET /a/:assetId",
           "Static assets: everything else (via ASSETS binding)",
         ],
-        note: "Flow unchanged: presigned PUT upload, then /commit converts+stores AVIF/WebP",
       });
     }
 
-    // ---- API routes ----
+    // 1) Presign URL for browser PUT to R2 (original bytes)
     if (url.pathname === "/upload-url" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         userId?: string;
@@ -319,14 +314,11 @@ export default {
       const mime = body.mime || "application/octet-stream";
       const bytes = body.bytes || 0;
 
-      const userPrefix = (body.userId || "anon").replace(
-        /[^a-zA-Z0-9._-]/g,
-        "_",
-      );
+      const userPrefix = sanitizeUserId(body.userId);
       const sha = (body.sha256 ?? "").trim();
       const fileKey = sha
-        ? `staging/${userPrefix}/${sha}`
-        : `staging/${userPrefix}/${assetId}`;
+        ? `staging/original/${userPrefix}/${sha}`
+        : `staging/original/${userPrefix}/${assetId}`;
 
       const putUrl = await presignR2Put(env, fileKey, PUT_URL_EXPIRES_SECONDS);
 
@@ -350,40 +342,37 @@ export default {
       });
     }
 
-    /**
-     * Commit: convert what was uploaded to R2 into AVIF or WebP and update HOT mapping
-     * (flow preserved; conversion happens server-side *before storing final key*).
-     */
+    // 2) Commit: read uploaded object, decode+encode, store converted key, update KV mapping
     if (url.pathname === "/commit" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         assetId?: string;
         r2Key?: string;
         mime?: string;
         bytes?: number;
-        format?: OutputFormat; // NEW optional: "avif" | "webp" (default avif)
+        format?: OutputFormat;
       };
 
-      if (!body.assetId || !body.r2Key)
+      if (!body.assetId || !body.r2Key) {
         return json({ error: "missing assetId/r2Key" }, 400);
+      }
 
-      // Verify object exists
       const original = await env.STAGING.get(body.r2Key);
-      if (!original)
+      if (!original) {
         return json({ error: "object not found in R2 (upload failed?)" }, 404);
+      }
 
-      // Load HOT record
       const raw = await env.HOT.get(`asset:${body.assetId}`);
       if (!raw) return json({ error: "assetId not found/expired" }, 404);
 
       const hot = JSON.parse(raw) as HotAsset;
 
-      // Convert
+      const format = pickFormat(body);
+
       let outBytes: Uint8Array;
       let outMime: string;
       let outExt: string;
 
       try {
-        const format = pickFormatFromBody(body);
         const imageData = await r2ObjectToImageData(original);
         const encoded = await encodeImage(imageData, format);
         outBytes = encoded.bytes;
@@ -399,7 +388,6 @@ export default {
         );
       }
 
-      // Store converted object (hash by converted bytes for dedupe)
       const outHash = await sha256HexBytes(outBytes.buffer);
       const convertedKey = `staging/converted/${outHash}.${outExt}`;
 
@@ -410,10 +398,9 @@ export default {
         },
       });
 
-      // Optionally delete original to save space
+      // Optional: delete original upload
       ctx.waitUntil(env.STAGING.delete(body.r2Key));
 
-      // Update HOT KV so /a/:assetId serves the converted version
       hot.r2Key = convertedKey;
       hot.mime = outMime;
       hot.bytes = outBytes.byteLength;
@@ -422,7 +409,6 @@ export default {
         expirationTtl: HOT_TTL_SECONDS,
       });
 
-      // Fire-and-forget persistence (no paid features)
       ctx.waitUntil(
         persistToDrive(env, hot).catch((err) => {
           console.error("persistToDrive failed", err);
@@ -432,13 +418,15 @@ export default {
       return json({
         ok: true,
         assetId: body.assetId,
+        originalKey: body.r2Key,
         r2Key: convertedKey,
         mime: outMime,
         bytes: outBytes.byteLength,
+        format,
       });
     }
 
-    // Serve assets by assetId
+    // 3) Serve asset by assetId
     {
       const m = url.pathname.match(/^\/a\/(.+)$/);
       if (m && req.method === "GET") {
@@ -452,7 +440,6 @@ export default {
 
         const headers = new Headers();
         headers.set("content-type", hot.mime);
-        // Cache reads for 1 hour at edge
         headers.set("cache-control", "public, max-age=3600");
 
         return new Response(obj.body, {
