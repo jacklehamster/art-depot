@@ -1,5 +1,52 @@
-import { encode as encodeAvif } from "@jsquash/avif";
-import { encode as encodeWebp } from "@jsquash/webp";
+import { encode as avifEncode } from "@jsquash/avif";
+import { encode as webpEncode } from "@jsquash/webp";
+
+type OutputFormat = "avif" | "webp";
+
+async function r2ObjectToImageData(obj: R2ObjectBody): Promise<ImageData> {
+  const ab = await obj.arrayBuffer();
+  const contentType =
+    obj.httpMetadata?.contentType || "application/octet-stream";
+
+  const blob = new Blob([ab], { type: contentType });
+
+  let bmp: ImageBitmap;
+  try {
+    bmp = await createImageBitmap(blob);
+  } catch {
+    throw new Error(
+      `Unsupported input for conversion: ${contentType}. Try JPEG/PNG/WebP.`,
+    );
+  }
+
+  const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Failed to get 2d context");
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+async function encodeImage(
+  imageData: ImageData,
+  format: OutputFormat,
+): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
+  if (format === "webp") {
+    const ab = await webpEncode(imageData, { quality: 80 } as any);
+    return { bytes: new Uint8Array(ab), mime: "image/webp", ext: "webp" };
+  }
+
+  const ab = await avifEncode(imageData, { quality: 45 } as any);
+  return { bytes: new Uint8Array(ab), mime: "image/avif", ext: "avif" };
+}
+
+async function sha256HexBytes(buf: ArrayBufferLike) {
+  const digest = await crypto.subtle.digest("SHA-256", buf as ArrayBuffer);
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 export interface Env {
   HOT: KVNamespace;
@@ -22,13 +69,6 @@ function json(data: unknown, status = 200) {
   });
 }
 
-async function sha256HexBytes(buf: ArrayBuffer) {
-  const digest = await crypto.subtle.digest("SHA-256", buf);
-  return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 type HotAsset = {
   assetId: string;
   r2Key: string;
@@ -49,8 +89,6 @@ function isApiRoute(pathname: string) {
 }
 
 async function persistToDrive(_env: Env, _hot: HotAsset) {}
-
-type OutputFormat = "avif" | "webp";
 
 function pickFormat(req: Request): OutputFormat {
   // Prefer explicit query param, else default to avif
@@ -139,13 +177,13 @@ async function compressToFormat(
   const imageData = await fileToImageData(file);
 
   if (format === "webp") {
-    const ab = await encodeWebp(imageData, {
+    const ab = await webpEncode(imageData, {
       quality: 80, // 0-100
     });
     return { bytes: new Uint8Array(ab), mime: "image/webp", ext: "webp" };
   }
 
-  const ab = await encodeAvif(imageData, {
+  const ab = await avifEncode(imageData, {
     quality: 45, // typical range ~20-60
     // speed: 6, // if supported by your version
   } as any);
@@ -251,40 +289,91 @@ export default {
       });
     }
 
-    // Keep your old /commit (optional; can remove if you fully migrate)
     if (url.pathname === "/commit" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         assetId?: string;
         r2Key?: string;
         mime?: string;
         bytes?: number;
+        format?: "avif" | "webp"; // optional: client can request
       };
 
       if (!body.assetId || !body.r2Key)
         return json({ error: "missing assetId/r2Key" }, 400);
 
-      const head = await env.STAGING.head(body.r2Key);
-      if (!head)
+      // Fetch the original (uploaded by browser via presigned PUT)
+      const original = await env.STAGING.get(body.r2Key);
+      if (!original)
         return json({ error: "object not found in R2 (upload failed?)" }, 404);
 
+      // Load HOT record
       const raw = await env.HOT.get(`asset:${body.assetId}`);
       if (!raw) return json({ error: "assetId not found/expired" }, 404);
 
       const hot = JSON.parse(raw) as HotAsset;
-      hot.mime = body.mime || hot.mime;
-      hot.bytes = body.bytes ?? hot.bytes ?? head.size ?? 0;
+
+      // Decide output format (default avif)
+      const format: "avif" | "webp" = body.format === "webp" ? "webp" : "avif";
+
+      // Convert
+      let outBytes: Uint8Array;
+      let outMime: string;
+      let outExt: string;
+      try {
+        const imageData = await r2ObjectToImageData(original);
+        const enc = await encodeImage(imageData, format);
+        outBytes = enc.bytes;
+        outMime = enc.mime;
+        outExt = enc.ext;
+      } catch (e) {
+        return json(
+          {
+            error: "conversion_failed",
+            message: e instanceof Error ? e.message : String(e),
+          },
+          400,
+        );
+      }
+
+      // Store converted object
+      const outHash = await sha256HexBytes(outBytes.buffer);
+      const convertedKey = `staging/converted/${outHash}.${outExt}`;
+
+      await env.STAGING.put(convertedKey, outBytes, {
+        httpMetadata: {
+          contentType: outMime,
+          cacheControl: "public, max-age=31536000, immutable",
+        },
+      });
+
+      // Optionally delete original to save space
+      // (comment out if you want to keep originals)
+      ctx.waitUntil(env.STAGING.delete(body.r2Key));
+
+      // Update HOT KV so /a/:assetId serves the converted version
+      hot.r2Key = convertedKey;
+      hot.mime = outMime;
+      hot.bytes = outBytes.byteLength;
 
       await env.HOT.put(`asset:${body.assetId}`, JSON.stringify(hot), {
         expirationTtl: HOT_TTL_SECONDS,
       });
 
+      // Fire-and-forget persistence hook (unchanged)
       ctx.waitUntil(
-        persistToDrive(env, hot).catch((e) => {
-          console.error("persistToDrive failed", e);
+        persistToDrive(env, hot).catch((err) => {
+          console.error("persistToDrive failed", err);
         }),
       );
 
-      return json({ ok: true, persisted: "scheduled" });
+      return json({
+        ok: true,
+        assetId: body.assetId,
+        r2Key: convertedKey,
+        mime: outMime,
+        bytes: outBytes.byteLength,
+        format,
+      });
     }
 
     // Serve stored assets
