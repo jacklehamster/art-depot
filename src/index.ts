@@ -195,8 +195,11 @@ async function fetchAssetWasm(env: Env, names: readonly string[]) {
   throw new Error(`Missing wasm in assets: tried ${names.join(", ")}`);
 }
 
-function makeInstantiateWasm(wasmBytes: ArrayBuffer) {
-  // Emscripten expects instantiateWasm(imports, successCallback)
+function makeInstantiateWasmSync(wasmBytes: ArrayBuffer) {
+  const bytes = new Uint8Array(wasmBytes);
+  // Compile once so we don't recompile per-init call
+  const module = new WebAssembly.Module(bytes);
+
   return (
     imports: WebAssembly.Imports,
     successCallback: (
@@ -204,18 +207,13 @@ function makeInstantiateWasm(wasmBytes: ArrayBuffer) {
       mod: WebAssembly.Module,
     ) => void,
   ) => {
-    // MUST return something synchronously; returning {} is fine for async instantiation.
-    WebAssembly.instantiate(wasmBytes, imports)
-      .then((r) => {
-        // r is { module, instance }
-        // @ts-ignore
-        successCallback(r.instance, r.module);
-      })
-      .catch((e) => {
-        console.error("instantiateWasm failed", e);
-        throw e;
-      });
-    return {} as any;
+    const instance = new WebAssembly.Instance(module, imports);
+
+    // Emscripten expects you to call successCallback
+    successCallback(instance, module);
+
+    // And return exports synchronously
+    return instance.exports as any;
   };
 }
 
@@ -231,28 +229,23 @@ async function ensureCodecsReady(env: Env) {
 
     // New API: init(moduleOptionOverrides?) -> Promise<void>
     await initJpegDecode({
-      instantiateWasm: makeInstantiateWasm(jpegDecWasm),
-      wasmBinary: new Uint8Array(jpegDecWasm),
+      instantiateWasm: makeInstantiateWasmSync(jpegDecWasm),
     } as any);
 
     await initPngDecode({
-      instantiateWasm: makeInstantiateWasm(pngWasm),
-      wasmBinary: new Uint8Array(pngWasm),
+      instantiateWasm: makeInstantiateWasmSync(pngWasm),
     } as any);
 
     await initWebpDecode({
-      instantiateWasm: makeInstantiateWasm(webpDecWasm),
-      wasmBinary: new Uint8Array(webpDecWasm),
+      instantiateWasm: makeInstantiateWasmSync(webpDecWasm),
     } as any);
 
     await initWebpEncode({
-      instantiateWasm: makeInstantiateWasm(webpEncWasm),
-      wasmBinary: new Uint8Array(webpEncWasm),
+      instantiateWasm: makeInstantiateWasmSync(webpEncWasm),
     } as any);
 
     await initAvifEncode({
-      instantiateWasm: makeInstantiateWasm(avifEncWasm),
-      wasmBinary: new Uint8Array(avifEncWasm),
+      instantiateWasm: makeInstantiateWasmSync(avifEncWasm),
     } as any);
   })();
 
@@ -373,7 +366,7 @@ export default {
           "GET /debug/wasm",
         ],
         wasmServedFrom: "/wasm/*.wasm (static assets)",
-        build: "instantiateWasm-v1",
+        build: "instantiateWasm-sync-v2",
       });
     }
 
