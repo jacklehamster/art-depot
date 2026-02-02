@@ -273,6 +273,48 @@ export default {
   ): Promise<Response> {
     const url = new URL(req.url);
 
+    if (url.pathname === "/debug/wasm") {
+      const candidates = [
+        "mozjpeg_dec.wasm",
+        "mozjpeg_dec_simd.wasm",
+        "webp_enc.wasm",
+        "webp_enc_simd.wasm",
+        "webp_dec.wasm",
+        "webp_dec_simd.wasm",
+        "avif_enc.wasm",
+        "avif_enc_simd.wasm",
+      ];
+
+      const results: any[] = [];
+      for (const f of candidates) {
+        const r = await env.ASSETS.fetch(
+          new Request(`https://assets.local/wasm/${f}`),
+        );
+        results.push({
+          file: f,
+          ok: r.ok,
+          status: r.status,
+          ct: r.headers.get("content-type"),
+        });
+      }
+
+      let initErr: any = null;
+      try {
+        // IMPORTANT: try the init() signature you showed: init(opts?) -> Promise<void>
+        await initWebpEncode({
+          locateFile: (name: string) =>
+            `https://artdepot.dobuki.net/wasm/${name}`,
+        } as any);
+      } catch (e) {
+        initErr = {
+          message: String((e as any)?.message || e),
+          stack: (e as any)?.stack,
+        };
+      }
+
+      return json({ assetFetch: results, initErr });
+    }
+
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
         ok: true,
