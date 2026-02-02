@@ -1,22 +1,5 @@
 /* eslint-disable no-console */
 
-/**
- * Worker: Presigned PUT upload to R2 + server-side convert on /commit (AVIF/WEBP),
- * keeping the original client flow:
- *   1) POST /upload-url  -> {assetId, r2Key, putUrl}
- *   2) PUT  putUrl       -> upload original bytes to R2
- *   3) POST /commit      -> server decodes + encodes + updates KV to converted key
- *   4) GET  /a/:assetId  -> serves converted object
- *
- * IMPORTANT:
- * - This uses the NEW jSquash API shape:
- *     init(opts?) -> Promise<void>
- *     default decode(buf) -> Promise<ImageData>
- *     default encode(imageData) -> Promise<ArrayBuffer>
- * - In Workers, WASM must be locatable. We provide locateFile to pull wasm from a CDN.
- * - Set JSQUASH_VERSIONS to match your package.json versions.
- */
-
 import jpegDecode, { init as initJpeg } from "@jsquash/jpeg/decode";
 import pngDecode, { init as initPng } from "@jsquash/png/decode";
 import webpDecode, { init as initWebpDec } from "@jsquash/webp/decode";
@@ -25,14 +8,10 @@ import avifEncode, { init as initAvifEnc } from "@jsquash/avif/encode";
 import webpEncode, { init as initWebpEnc } from "@jsquash/webp/encode";
 
 export interface Env {
-  // Storage
   HOT: KVNamespace;
   STAGING: R2Bucket;
-
-  // Static assets binding (Workers Static Assets)
   ASSETS: Fetcher;
 
-  // R2 presign config
   R2_ACCOUNT_ID: string;
   R2_BUCKET: string;
   R2_ACCESS_KEY_ID: string;
@@ -50,58 +29,52 @@ type HotAsset = {
 };
 
 const enc = new TextEncoder();
-
-const HOT_TTL_SECONDS = 12 * 60 * 60; // 12 hours
+const HOT_TTL_SECONDS = 12 * 60 * 60;
 const PUT_URL_EXPIRES_SECONDS = 5 * 60;
 
 // -----------------------------
-// jSquash WASM loading (NEW API)
+// Serve your own wasm files under /wasm/*
 // -----------------------------
-// ⚠️ Set these to match your installed versions in package.json
-const JSQUASH_VERSIONS = {
-  jpeg: "1.4.0",
-  png: "3.0.1",
-  webp: "1.5.0",
-  avif: "2.1.1",
+// Put these in public/wasm/ (see instructions above)
+const WASM_FILES = {
+  jpeg_dec: "mozjpeg_dec.wasm",
+  png: "squoosh_png_bg.wasm",
+  webp_dec: "webp_dec.wasm",
+  webp_enc: "webp_enc.wasm",
+  avif_enc: "avif_enc.wasm",
 } as const;
-
-// You can swap unpkg -> cdn.jsdelivr.net if preferred.
-const JSQUASH_CDN = "https://unpkg.com";
-
-// Emscripten locateFile callback
-function locateFileFor(pkg: string, version: string) {
-  return (path: string, prefix: string) => {
-    const pfx = (prefix || "").replace(/^\.\//, "");
-    const joined = `${pfx}${path}`.replace(/^\.\//, "");
-    return `${JSQUASH_CDN}/${pkg}@${version}/${joined}`;
-  };
-}
 
 let codecsReady: Promise<void> | null = null;
 
-function ensureCodecsReady() {
+/**
+ * jSquash's init() uses Emscripten Module options.
+ * We provide locateFile so that when it asks for *.wasm, it fetches from our own origin: /wasm/<file>.
+ *
+ * IMPORTANT:
+ * Different codecs may request different filenames. To be robust, we:
+ * - If the requested path already ends with ".wasm", we return /wasm/<that filename>
+ * - Else we fall back to /wasm/<path>
+ */
+function makeLocateFile(baseUrl: string) {
+  return (path: string, _prefix: string) => {
+    // Some builds pass things like "mozjpeg_dec.wasm" or "./mozjpeg_dec.wasm"
+    const file = path.split("/").pop() || path;
+    const clean = file.replace(/^\.\//, "");
+    return new URL(`/wasm/${clean}`, baseUrl).toString();
+  };
+}
+
+function ensureCodecsReady(baseUrl: string) {
   codecsReady ??= (async () => {
-    // Decoders
-    await initJpeg({
-      locateFile: locateFileFor("@jsquash/jpeg", JSQUASH_VERSIONS.jpeg),
-    } as any);
+    const locateFile = makeLocateFile(baseUrl);
 
-    await initPng({
-      locateFile: locateFileFor("@jsquash/png", JSQUASH_VERSIONS.png),
-    } as any);
+    // NOTE: New API shape: init(opts?) -> Promise<void>
+    await initJpeg({ locateFile } as any);
+    await initPng({ locateFile } as any);
+    await initWebpDec({ locateFile } as any);
 
-    await initWebpDec({
-      locateFile: locateFileFor("@jsquash/webp", JSQUASH_VERSIONS.webp),
-    } as any);
-
-    // Encoders
-    await initAvifEnc({
-      locateFile: locateFileFor("@jsquash/avif", JSQUASH_VERSIONS.avif),
-    } as any);
-
-    await initWebpEnc({
-      locateFile: locateFileFor("@jsquash/webp", JSQUASH_VERSIONS.webp),
-    } as any);
+    await initWebpEnc({ locateFile } as any);
+    await initAvifEnc({ locateFile } as any);
   })();
 
   return codecsReady;
@@ -118,7 +91,6 @@ function json(data: unknown, status = 200) {
 }
 
 function isApiRoute(pathname: string) {
-  // Keep static assets clean by reserving these
   return (
     pathname === "/upload-url" ||
     pathname === "/commit" ||
@@ -166,17 +138,6 @@ async function sha256HexBytes(buf: ArrayBufferLike) {
     .join("");
 }
 
-function sanitizeUserId(userId?: string) {
-  return (userId || "anon").replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function pickFormat(body: any): OutputFormat {
-  return body?.format === "webp" ? "webp" : "avif";
-}
-
-// -----------------------------
-// Presigned PUT URL for R2 (S3 SigV4)
-// -----------------------------
 async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   const { dateStamp, amzDate } = awsDates();
   const region = "auto";
@@ -221,7 +182,6 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
     await sha256Hex(canonicalRequest),
   ].join("\n");
 
-  // SigV4 key derivation
   const kSecret = enc.encode(`AWS4${env.R2_SECRET_ACCESS_KEY}`).buffer;
   const kDate = (await hmacSha256(kSecret, dateStamp)).buffer;
   const kRegion = (await hmacSha256(kDate, region)).buffer;
@@ -236,18 +196,31 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
+async function persistToDrive(_env: Env, _hot: HotAsset) {}
+
+function sanitizeUserId(userId?: string): string {
+  if (!userId) return "anonymous";
+  return userId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+}
+
+function pickFormat(body: any): OutputFormat {
+  return body?.format === "webp" ? "webp" : "avif";
+}
+
 // -----------------------------
-// Decode + encode helpers
+// Decode + encode
 // -----------------------------
-async function r2ObjectToImageData(obj: R2ObjectBody): Promise<ImageData> {
-  await ensureCodecsReady();
+async function r2ObjectToImageData(
+  obj: R2ObjectBody,
+  baseUrl: string,
+): Promise<ImageData> {
+  await ensureCodecsReady(baseUrl);
 
   const ab = await obj.arrayBuffer();
   const contentType =
     obj.httpMetadata?.contentType || "application/octet-stream";
   const ct = contentType.toLowerCase();
 
-  // Decode based on MIME. (You can add sniffing if needed.)
   if (ct.includes("image/jpeg") || ct.includes("image/jpg"))
     return await jpegDecode(ab);
   if (ct.includes("image/png")) return await pngDecode(ab);
@@ -261,8 +234,9 @@ async function r2ObjectToImageData(obj: R2ObjectBody): Promise<ImageData> {
 async function encodeImage(
   imageData: ImageData,
   format: OutputFormat,
+  baseUrl: string,
 ): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
-  await ensureCodecsReady();
+  await ensureCodecsReady(baseUrl);
 
   if (format === "webp") {
     const ab = await webpEncode(imageData, { quality: 80 } as any);
@@ -274,11 +248,6 @@ async function encodeImage(
 }
 
 // -----------------------------
-// Placeholder hook
-// -----------------------------
-async function persistToDrive(_env: Env, _hot: HotAsset) {}
-
-// -----------------------------
 // Worker
 // -----------------------------
 export default {
@@ -288,6 +257,7 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(req.url);
+    const baseUrl = `${url.protocol}//${url.host}`;
 
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
@@ -296,12 +266,12 @@ export default {
           "POST /upload-url",
           "POST /commit (optional format: avif|webp)",
           "GET /a/:assetId",
-          "Static assets: everything else (via ASSETS binding)",
+          "GET /wasm/<file>.wasm (served by ASSETS)",
         ],
+        wasmExpectedAt: Object.values(WASM_FILES).map((f) => `/wasm/${f}`),
       });
     }
 
-    // 1) Presign URL for browser PUT to R2 (original bytes)
     if (url.pathname === "/upload-url" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         userId?: string;
@@ -316,6 +286,7 @@ export default {
 
       const userPrefix = sanitizeUserId(body.userId);
       const sha = (body.sha256 ?? "").trim();
+
       const fileKey = sha
         ? `staging/original/${userPrefix}/${sha}`
         : `staging/original/${userPrefix}/${assetId}`;
@@ -342,7 +313,6 @@ export default {
       });
     }
 
-    // 2) Commit: read uploaded object, decode+encode, store converted key, update KV mapping
     if (url.pathname === "/commit" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         assetId?: string;
@@ -365,19 +335,45 @@ export default {
       if (!raw) return json({ error: "assetId not found/expired" }, 404);
 
       const hot = JSON.parse(raw) as HotAsset;
-
       const format = pickFormat(body);
 
-      let outBytes: Uint8Array;
-      let outMime: string;
-      let outExt: string;
-
       try {
-        const imageData = await r2ObjectToImageData(original);
-        const encoded = await encodeImage(imageData, format);
-        outBytes = encoded.bytes;
-        outMime = encoded.mime;
-        outExt = encoded.ext;
+        const imageData = await r2ObjectToImageData(original, baseUrl);
+        const encoded = await encodeImage(imageData, format, baseUrl);
+
+        const outHash = await sha256HexBytes(encoded.bytes.buffer);
+        const convertedKey = `staging/converted/${outHash}.${encoded.ext}`;
+
+        await env.STAGING.put(convertedKey, encoded.bytes, {
+          httpMetadata: {
+            contentType: encoded.mime,
+            cacheControl: "public, max-age=31536000, immutable",
+          },
+        });
+
+        // delete original to save space (optional)
+        ctx.waitUntil(env.STAGING.delete(body.r2Key));
+
+        hot.r2Key = convertedKey;
+        hot.mime = encoded.mime;
+        hot.bytes = encoded.bytes.byteLength;
+
+        await env.HOT.put(`asset:${body.assetId}`, JSON.stringify(hot), {
+          expirationTtl: HOT_TTL_SECONDS,
+        });
+
+        ctx.waitUntil(
+          persistToDrive(env, hot).catch((err) => console.error(err)),
+        );
+
+        return json({
+          ok: true,
+          assetId: body.assetId,
+          r2Key: convertedKey,
+          mime: encoded.mime,
+          bytes: encoded.bytes.byteLength,
+          format,
+        });
       } catch (e) {
         return json(
           {
@@ -387,46 +383,8 @@ export default {
           400,
         );
       }
-
-      const outHash = await sha256HexBytes(outBytes.buffer);
-      const convertedKey = `staging/converted/${outHash}.${outExt}`;
-
-      await env.STAGING.put(convertedKey, outBytes, {
-        httpMetadata: {
-          contentType: outMime,
-          cacheControl: "public, max-age=31536000, immutable",
-        },
-      });
-
-      // Optional: delete original upload
-      ctx.waitUntil(env.STAGING.delete(body.r2Key));
-
-      hot.r2Key = convertedKey;
-      hot.mime = outMime;
-      hot.bytes = outBytes.byteLength;
-
-      await env.HOT.put(`asset:${body.assetId}`, JSON.stringify(hot), {
-        expirationTtl: HOT_TTL_SECONDS,
-      });
-
-      ctx.waitUntil(
-        persistToDrive(env, hot).catch((err) => {
-          console.error("persistToDrive failed", err);
-        }),
-      );
-
-      return json({
-        ok: true,
-        assetId: body.assetId,
-        originalKey: body.r2Key,
-        r2Key: convertedKey,
-        mime: outMime,
-        bytes: outBytes.byteLength,
-        format,
-      });
     }
 
-    // 3) Serve asset by assetId
     {
       const m = url.pathname.match(/^\/a\/(.+)$/);
       if (m && req.method === "GET") {
@@ -449,7 +407,7 @@ export default {
       }
     }
 
-    // ---- Static assets fallback ----
+    // Static assets fallback (includes /wasm/*.wasm)
     if (!isApiRoute(url.pathname)) {
       return env.ASSETS.fetch(req);
     }

@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev src/index.ts --config wrangler.dev.toml",
-    "deploy": "wrangler deploy",
-    "build": "bun i && tsc"
+    "copy-wasm": "node scripts/copy-wasm.mjs",
+    "dev": "bun run copy-wasm && wrangler dev src/index.ts --config wrangler.dev.toml",
+    "deploy": "bun run copy-wasm && wrangler deploy",
+    "build": "bun i && bun run copy-wasm && tsc"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",
