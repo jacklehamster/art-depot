@@ -1,13 +1,11 @@
 /* eslint-disable no-console */
 
-import { init as initAvifEncode } from "@jsquash/avif/encode";
-import avifEncode from "@jsquash/avif/encode";
-import { init as initWebpEncode } from "@jsquash/webp/encode";
-import webpEncode from "@jsquash/webp/encode";
-
 import jpegDecode, { init as initJpegDecode } from "@jsquash/jpeg/decode";
 import pngDecode, { init as initPngDecode } from "@jsquash/png/decode";
 import webpDecode, { init as initWebpDecode } from "@jsquash/webp/decode";
+
+import avifEncode, { init as initAvifEncode } from "@jsquash/avif/encode";
+import webpEncode, { init as initWebpEncode } from "@jsquash/webp/encode";
 
 export interface Env {
   HOT: KVNamespace;
@@ -31,25 +29,14 @@ type HotAsset = {
 };
 
 const enc = new TextEncoder();
-
 const HOT_TTL_SECONDS = 12 * 60 * 60; // 12 hours
 const PUT_URL_EXPIRES_SECONDS = 5 * 60;
 
-// ---- helpers ----
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
-}
-
-function isApiRoute(pathname: string) {
-  return (
-    pathname === "/upload-url" ||
-    pathname === "/commit" ||
-    pathname.startsWith("/a/") ||
-    pathname === "/api"
-  );
 }
 
 function awsDates(d = new Date()) {
@@ -91,18 +78,10 @@ async function sha256HexBytes(buf: ArrayBufferLike) {
     .join("");
 }
 
-function sanitizeUserId(userId?: string) {
-  return (userId || "anon").replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function pickFormat(req: Request, body?: any): OutputFormat {
-  if (body?.format === "webp") return "webp";
-  const url = new URL(req.url);
-  const f = (url.searchParams.get("format") || "").toLowerCase();
-  return f === "webp" ? "webp" : "avif";
-}
-
-// ---- presign ----
+/**
+ * Presigned PUT URL for R2 (S3 SigV4).
+ * Signs only `host`, uses UNSIGNED-PAYLOAD (browser can set Content-Type freely).
+ */
 async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   const { dateStamp, amzDate } = awsDates();
   const region = "auto";
@@ -147,6 +126,7 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
     await sha256Hex(canonicalRequest),
   ].join("\n");
 
+  // SigV4 key derivation
   const kSecret = enc.encode(`AWS4${env.R2_SECRET_ACCESS_KEY}`).buffer;
   const kDate = (await hmacSha256(kSecret, dateStamp)).buffer;
   const kRegion = (await hmacSha256(kDate, region)).buffer;
@@ -161,57 +141,78 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-// ---- jSquash wasm boot ----
-// We load wasm BYTES from static assets using env.ASSETS.fetch,
-// then pass wasmBinary into init(). This avoids Emscripten doing fetch() itself.
-const WASM_CANDIDATES = {
-  jpeg_dec: ["mozjpeg_dec_simd.wasm", "mozjpeg_dec.wasm"],
-  png: ["squoosh_png_bg.wasm"],
-  webp_dec: ["webp_dec_simd.wasm", "webp_dec.wasm"],
-  webp_enc: ["webp_enc_simd.wasm", "webp_enc.wasm"],
-  avif_enc: ["avif_enc_simd.wasm", "avif_enc.wasm"],
-} as const;
-
-async function loadWasmFromAssets(env: Env, candidates: readonly string[]) {
-  for (const name of candidates) {
-    const req = new Request(`https://assets.local/wasm/${name}`);
-    const res = await env.ASSETS.fetch(req);
-    if (res.ok) return await res.arrayBuffer();
-  }
-  throw new Error(
-    `Missing wasm in assets. Tried: ${candidates.join(", ")} (expected under /public/wasm/)`,
+function isApiRoute(pathname: string) {
+  return (
+    pathname === "/upload-url" ||
+    pathname === "/commit" ||
+    pathname.startsWith("/a/") ||
+    pathname === "/api"
   );
 }
 
+async function persistToDrive(_env: Env, _hot: HotAsset) {}
+
+function pickFormat(req: Request, body: any): OutputFormat {
+  if (body?.format === "webp") return "webp";
+  const url = new URL(req.url);
+  const f = (url.searchParams.get("format") || "").toLowerCase();
+  return f === "webp" ? "webp" : "avif";
+}
+
+/**
+ * ✅ The important fix:
+ * - Strip any directories from the wasm path
+ * - Force non-SIMD wasm by rewriting *_simd.wasm → *.wasm
+ * Because your /wasm has only non-simd wasm files (simd 404s).
+ */
+function makeLocateFile(origin: string) {
+  return (path: string, prefix?: string) => {
+    // Emscripten sometimes passes prefix + path, sometimes just path.
+    const raw = `${prefix || ""}${path}`;
+    const base = raw.split("/").pop() || raw;
+    const clean = base.replace(/^\.\//, "");
+
+    // Force non-simd
+    const nonSimd = clean.replace(/_simd\.wasm$/i, ".wasm");
+
+    return `${origin}/wasm/${nonSimd}`;
+  };
+}
+
 let codecsInitPromise: Promise<void> | null = null;
+let codecsInitOrigin: string | null = null;
 
-async function ensureCodecsReady(env: Env) {
-  codecsInitPromise ??= (async () => {
-    const jpegDec = await loadWasmFromAssets(env, WASM_CANDIDATES.jpeg_dec);
-    const png = await loadWasmFromAssets(env, WASM_CANDIDATES.png);
-    const webpDec = await loadWasmFromAssets(env, WASM_CANDIDATES.webp_dec);
-    const webpEnc = await loadWasmFromAssets(env, WASM_CANDIDATES.webp_enc);
-    const avifEnc = await loadWasmFromAssets(env, WASM_CANDIDATES.avif_enc);
+async function ensureCodecsReady(origin: string) {
+  if (codecsInitPromise && codecsInitOrigin === origin)
+    return codecsInitPromise;
 
-    await initJpegDecode({ wasmBinary: jpegDec } as any);
-    await initPngDecode({ wasmBinary: png } as any);
-    await initWebpDecode({ wasmBinary: webpDec } as any);
+  codecsInitOrigin = origin;
+  const locateFile = makeLocateFile(origin);
 
-    await initWebpEncode({ wasmBinary: webpEnc } as any);
-    await initAvifEncode({ wasmBinary: avifEnc } as any);
+  codecsInitPromise = (async () => {
+    // New API: init(opts?) -> Promise<void>
+    await initJpegDecode({ locateFile } as any);
+    await initPngDecode({ locateFile } as any);
+    await initWebpDecode({ locateFile } as any);
+
+    await initWebpEncode({ locateFile } as any);
+    await initAvifEncode({ locateFile } as any);
   })();
 
   return codecsInitPromise;
 }
 
-// ---- decode/encode pipeline ----
 async function r2ObjectToImageData(
   env: Env,
+  origin: string,
   obj: R2ObjectBody,
 ): Promise<ImageData> {
-  await ensureCodecsReady(env);
+  await ensureCodecsReady(origin);
 
   const ab = await obj.arrayBuffer();
+
+  // Content-Type can be missing/incorrect on S3-style PUT, so try decoders.
+  // Try by header first, then fall back to brute-force attempts.
   const ct =
     obj.httpMetadata?.contentType ||
     (obj as any).headers?.get?.("content-type") ||
@@ -219,18 +220,15 @@ async function r2ObjectToImageData(
 
   const m = ct.toLowerCase();
 
-  // Prefer decode based on mime, but fall back to sniffing attempts if mime missing/wrong.
   try {
     if (m.includes("image/jpeg") || m.includes("image/jpg"))
       return await jpegDecode(ab);
     if (m.includes("image/png")) return await pngDecode(ab);
     if (m.includes("image/webp")) return await webpDecode(ab);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`Decode failed (${ct}): ${msg}`);
+  } catch {
+    // fall through to brute-force
   }
 
-  // Mime might be application/octet-stream; try common decoders.
   try {
     return await jpegDecode(ab);
   } catch {}
@@ -247,11 +245,11 @@ async function r2ObjectToImageData(
 }
 
 async function encodeImage(
-  env: Env,
-  imageData: ImageData,
+  origin: string,
   format: OutputFormat,
+  imageData: ImageData,
 ): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
-  await ensureCodecsReady(env);
+  await ensureCodecsReady(origin);
 
   if (format === "webp") {
     const ab = await webpEncode(imageData, { quality: 80 } as any);
@@ -262,9 +260,6 @@ async function encodeImage(
   return { bytes: new Uint8Array(ab), mime: "image/avif", ext: "avif" };
 }
 
-async function persistToDrive(_env: Env, _hot: HotAsset) {}
-
-// ---- worker ----
 export default {
   async fetch(
     req: Request,
@@ -272,60 +267,18 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(req.url);
-
-    if (url.pathname === "/debug/wasm") {
-      const candidates = [
-        "mozjpeg_dec.wasm",
-        "mozjpeg_dec_simd.wasm",
-        "webp_enc.wasm",
-        "webp_enc_simd.wasm",
-        "webp_dec.wasm",
-        "webp_dec_simd.wasm",
-        "avif_enc.wasm",
-        "avif_enc_simd.wasm",
-      ];
-
-      const results: any[] = [];
-      for (const f of candidates) {
-        const r = await env.ASSETS.fetch(
-          new Request(`https://assets.local/wasm/${f}`),
-        );
-        results.push({
-          file: f,
-          ok: r.ok,
-          status: r.status,
-          ct: r.headers.get("content-type"),
-        });
-      }
-
-      let initErr: any = null;
-      try {
-        // IMPORTANT: try the init() signature you showed: init(opts?) -> Promise<void>
-        await initWebpEncode({
-          locateFile: (name: string) =>
-            `https://artdepot.dobuki.net/wasm/${name}`,
-        } as any);
-      } catch (e) {
-        initErr = {
-          message: String((e as any)?.message || e),
-          stack: (e as any)?.stack,
-        };
-      }
-
-      return json({ assetFetch: results, initErr });
-    }
+    const origin = url.origin;
 
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
         ok: true,
         routes: [
           "POST /upload-url",
-          "POST /commit (optional format=avif|webp via query or JSON body)",
+          "POST /commit?format=avif|webp",
           "GET /a/:assetId",
           "Static assets: everything else (via ASSETS binding)",
         ],
-        wasmExpectedSomewhere: "/wasm/*.wasm (served from static assets)",
-        wasmCandidates: WASM_CANDIDATES,
+        note: "Make sure wasm files are served at /wasm/*.wasm. SIMD filenames are rewritten to non-simd.",
       });
     }
 
@@ -341,7 +294,10 @@ export default {
       const mime = body.mime || "application/octet-stream";
       const bytes = body.bytes || 0;
 
-      const userPrefix = sanitizeUserId(body.userId);
+      const userPrefix = (body.userId || "anon").replace(
+        /[^a-zA-Z0-9._-]/g,
+        "_",
+      );
       const sha = (body.sha256 ?? "").trim();
       const fileKey = sha
         ? `staging/${userPrefix}/${sha}`
@@ -389,12 +345,11 @@ export default {
       if (!raw) return json({ error: "assetId not found/expired" }, 404);
 
       const hot = JSON.parse(raw) as HotAsset;
-
       const format = pickFormat(req, body);
 
       try {
-        const imageData = await r2ObjectToImageData(env, original);
-        const out = await encodeImage(env, imageData, format);
+        const imageData = await r2ObjectToImageData(env, origin, original);
+        const out = await encodeImage(origin, format, imageData);
 
         const outHash = await sha256HexBytes(out.bytes.buffer);
         const convertedKey = `staging/converted/${outHash}.${out.ext}`;
@@ -406,7 +361,7 @@ export default {
           },
         });
 
-        // Delete original to save space (optional)
+        // Optional: delete the original upload
         ctx.waitUntil(env.STAGING.delete(body.r2Key));
 
         hot.r2Key = convertedKey;
@@ -442,7 +397,6 @@ export default {
       }
     }
 
-    // Serve assets by assetId
     {
       const m = url.pathname.match(/^\/a\/(.+)$/);
       if (m && req.method === "GET") {
@@ -465,7 +419,6 @@ export default {
       }
     }
 
-    // Static assets fallback
     if (!isApiRoute(url.pathname)) {
       return env.ASSETS.fetch(req);
     }
