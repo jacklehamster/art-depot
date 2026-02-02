@@ -8,10 +8,14 @@ import avifEncode, { init as initAvifEncode } from "@jsquash/avif/encode";
 import webpEncode, { init as initWebpEncode } from "@jsquash/webp/encode";
 
 export interface Env {
+  // Storage
   HOT: KVNamespace;
   STAGING: R2Bucket;
+
+  // Static assets binding (Workers Static Assets)
   ASSETS: Fetcher;
 
+  // R2 presign config
   R2_ACCOUNT_ID: string;
   R2_BUCKET: string;
   R2_ACCESS_KEY_ID: string;
@@ -29,9 +33,11 @@ type HotAsset = {
 };
 
 const enc = new TextEncoder();
+
 const HOT_TTL_SECONDS = 12 * 60 * 60; // 12 hours
 const PUT_URL_EXPIRES_SECONDS = 5 * 60;
 
+// ---------- misc ----------
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -39,6 +45,28 @@ function json(data: unknown, status = 200) {
   });
 }
 
+function isApiRoute(pathname: string) {
+  return (
+    pathname === "/upload-url" ||
+    pathname === "/commit" ||
+    pathname.startsWith("/a/") ||
+    pathname === "/api" ||
+    pathname.startsWith("/debug/")
+  );
+}
+
+function sanitizeUserId(userId?: string) {
+  return (userId || "anon").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function pickFormat(req: Request, body: any): OutputFormat {
+  if (body?.format === "webp") return "webp";
+  const url = new URL(req.url);
+  const f = (url.searchParams.get("format") || "").toLowerCase();
+  return f === "webp" ? "webp" : "avif";
+}
+
+// ---------- crypto ----------
 function awsDates(d = new Date()) {
   const pad = (n: number) => String(n).padStart(2, "0");
   const y = d.getUTCFullYear();
@@ -78,10 +106,7 @@ async function sha256HexBytes(buf: ArrayBufferLike) {
     .join("");
 }
 
-/**
- * Presigned PUT URL for R2 (S3 SigV4).
- * Signs only `host`, uses UNSIGNED-PAYLOAD (browser can set Content-Type freely).
- */
+// ---------- presign ----------
 async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   const { dateStamp, amzDate } = awsDates();
   const region = "auto";
@@ -126,7 +151,6 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
     await sha256Hex(canonicalRequest),
   ].join("\n");
 
-  // SigV4 key derivation
   const kSecret = enc.encode(`AWS4${env.R2_SECRET_ACCESS_KEY}`).buffer;
   const kDate = (await hmacSha256(kSecret, dateStamp)).buffer;
   const kRegion = (await hmacSha256(kDate, region)).buffer;
@@ -141,94 +165,125 @@ async function presignR2Put(env: Env, key: string, expiresSeconds: number) {
   return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
-function isApiRoute(pathname: string) {
-  return (
-    pathname === "/upload-url" ||
-    pathname === "/commit" ||
-    pathname.startsWith("/a/") ||
-    pathname === "/api"
-  );
-}
-
-async function persistToDrive(_env: Env, _hot: HotAsset) {}
-
-function pickFormat(req: Request, body: any): OutputFormat {
-  if (body?.format === "webp") return "webp";
-  const url = new URL(req.url);
-  const f = (url.searchParams.get("format") || "").toLowerCase();
-  return f === "webp" ? "webp" : "avif";
-}
-
+// ---------- WASM init (instantiateWasm) ----------
 /**
- * ✅ The important fix:
- * - Strip any directories from the wasm path
- * - Force non-SIMD wasm by rewriting *_simd.wasm → *.wasm
- * Because your /wasm has only non-simd wasm files (simd 404s).
+ * We *do not* let Emscripten fetch wasm. We load it ourselves from static assets and provide instantiateWasm.
+ * This avoids: locateFile mismatch, SIMD fallbacks, origin recursion, and the exact abort you're seeing.
+ *
+ * Your debug shows these exist:
+ *  - /wasm/mozjpeg_dec.wasm
+ *  - /wasm/squoosh_png_bg.wasm
+ *  - /wasm/webp_dec.wasm
+ *  - /wasm/webp_enc.wasm
+ *  - /wasm/avif_enc.wasm
  */
-function makeLocateFile(origin: string) {
-  return (path: string, prefix?: string) => {
-    // Emscripten sometimes passes prefix + path, sometimes just path.
-    const raw = `${prefix || ""}${path}`;
-    const base = raw.split("/").pop() || raw;
-    const clean = base.replace(/^\.\//, "");
+const WASM = {
+  jpegDec: ["mozjpeg_dec.wasm"],
+  png: ["squoosh_png_bg.wasm"],
+  webpDec: ["webp_dec.wasm"],
+  webpEnc: ["webp_enc.wasm"],
+  avifEnc: ["avif_enc.wasm"],
+} as const;
 
-    // Force non-simd
-    const nonSimd = clean.replace(/_simd\.wasm$/i, ".wasm");
+async function fetchAssetWasm(env: Env, names: readonly string[]) {
+  for (const name of names) {
+    const res = await env.ASSETS.fetch(
+      new Request(`https://assets.local/wasm/${name}`),
+    );
+    if (res.ok) return await res.arrayBuffer();
+  }
+  throw new Error(`Missing wasm in assets: tried ${names.join(", ")}`);
+}
 
-    return `${origin}/wasm/${nonSimd}`;
+function makeInstantiateWasm(wasmBytes: ArrayBuffer) {
+  // Emscripten expects instantiateWasm(imports, successCallback)
+  return (
+    imports: WebAssembly.Imports,
+    successCallback: (
+      inst: WebAssembly.Instance,
+      mod: WebAssembly.Module,
+    ) => void,
+  ) => {
+    // MUST return something synchronously; returning {} is fine for async instantiation.
+    WebAssembly.instantiate(wasmBytes, imports)
+      .then((r) => {
+        // r is { module, instance }
+        // @ts-ignore
+        successCallback(r.instance, r.module);
+      })
+      .catch((e) => {
+        console.error("instantiateWasm failed", e);
+        throw e;
+      });
+    return {} as any;
   };
 }
 
 let codecsInitPromise: Promise<void> | null = null;
-let codecsInitOrigin: string | null = null;
 
-async function ensureCodecsReady(origin: string) {
-  if (codecsInitPromise && codecsInitOrigin === origin)
-    return codecsInitPromise;
+async function ensureCodecsReady(env: Env) {
+  codecsInitPromise ??= (async () => {
+    const jpegDecWasm = await fetchAssetWasm(env, WASM.jpegDec);
+    const pngWasm = await fetchAssetWasm(env, WASM.png);
+    const webpDecWasm = await fetchAssetWasm(env, WASM.webpDec);
+    const webpEncWasm = await fetchAssetWasm(env, WASM.webpEnc);
+    const avifEncWasm = await fetchAssetWasm(env, WASM.avifEnc);
 
-  codecsInitOrigin = origin;
-  const locateFile = makeLocateFile(origin);
+    // New API: init(moduleOptionOverrides?) -> Promise<void>
+    await initJpegDecode({
+      instantiateWasm: makeInstantiateWasm(jpegDecWasm),
+      wasmBinary: new Uint8Array(jpegDecWasm),
+    } as any);
 
-  codecsInitPromise = (async () => {
-    // New API: init(opts?) -> Promise<void>
-    await initJpegDecode({ locateFile } as any);
-    await initPngDecode({ locateFile } as any);
-    await initWebpDecode({ locateFile } as any);
+    await initPngDecode({
+      instantiateWasm: makeInstantiateWasm(pngWasm),
+      wasmBinary: new Uint8Array(pngWasm),
+    } as any);
 
-    await initWebpEncode({ locateFile } as any);
-    await initAvifEncode({ locateFile } as any);
+    await initWebpDecode({
+      instantiateWasm: makeInstantiateWasm(webpDecWasm),
+      wasmBinary: new Uint8Array(webpDecWasm),
+    } as any);
+
+    await initWebpEncode({
+      instantiateWasm: makeInstantiateWasm(webpEncWasm),
+      wasmBinary: new Uint8Array(webpEncWasm),
+    } as any);
+
+    await initAvifEncode({
+      instantiateWasm: makeInstantiateWasm(avifEncWasm),
+      wasmBinary: new Uint8Array(avifEncWasm),
+    } as any);
   })();
 
   return codecsInitPromise;
 }
 
+// ---------- pipeline ----------
 async function r2ObjectToImageData(
   env: Env,
-  origin: string,
   obj: R2ObjectBody,
 ): Promise<ImageData> {
-  await ensureCodecsReady(origin);
+  await ensureCodecsReady(env);
 
   const ab = await obj.arrayBuffer();
-
-  // Content-Type can be missing/incorrect on S3-style PUT, so try decoders.
-  // Try by header first, then fall back to brute-force attempts.
   const ct =
     obj.httpMetadata?.contentType ||
     (obj as any).headers?.get?.("content-type") ||
     "application/octet-stream";
-
   const m = ct.toLowerCase();
 
+  // Try based on mime if present
   try {
     if (m.includes("image/jpeg") || m.includes("image/jpg"))
       return await jpegDecode(ab);
     if (m.includes("image/png")) return await pngDecode(ab);
     if (m.includes("image/webp")) return await webpDecode(ab);
   } catch {
-    // fall through to brute-force
+    // fall through
   }
 
+  // Brute force if mime missing/wrong (common with presigned PUT)
   try {
     return await jpegDecode(ab);
   } catch {}
@@ -245,11 +300,11 @@ async function r2ObjectToImageData(
 }
 
 async function encodeImage(
-  origin: string,
-  format: OutputFormat,
+  env: Env,
   imageData: ImageData,
+  format: OutputFormat,
 ): Promise<{ bytes: Uint8Array; mime: string; ext: string }> {
-  await ensureCodecsReady(origin);
+  await ensureCodecsReady(env);
 
   if (format === "webp") {
     const ab = await webpEncode(imageData, { quality: 80 } as any);
@@ -260,6 +315,10 @@ async function encodeImage(
   return { bytes: new Uint8Array(ab), mime: "image/avif", ext: "avif" };
 }
 
+// ---------- hook ----------
+async function persistToDrive(_env: Env, _hot: HotAsset) {}
+
+// ---------- worker ----------
 export default {
   async fetch(
     req: Request,
@@ -267,7 +326,42 @@ export default {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(req.url);
-    const origin = url.origin;
+
+    // Debug endpoint you can keep while iterating
+    if (url.pathname === "/debug/wasm") {
+      const files = [
+        "mozjpeg_dec.wasm",
+        "squoosh_png_bg.wasm",
+        "webp_dec.wasm",
+        "webp_enc.wasm",
+        "avif_enc.wasm",
+      ];
+
+      const assetFetch = [];
+      for (const f of files) {
+        const r = await env.ASSETS.fetch(
+          new Request(`https://assets.local/wasm/${f}`),
+        );
+        assetFetch.push({
+          file: f,
+          ok: r.ok,
+          status: r.status,
+          ct: r.headers.get("content-type"),
+        });
+      }
+
+      let initErr: any = null;
+      try {
+        await ensureCodecsReady(env);
+      } catch (e) {
+        initErr = {
+          message: String((e as any)?.message || e),
+          stack: (e as any)?.stack,
+        };
+      }
+
+      return json({ assetFetch, initErr });
+    }
 
     if (url.pathname === "/api" && req.method === "GET") {
       return json({
@@ -276,12 +370,14 @@ export default {
           "POST /upload-url",
           "POST /commit?format=avif|webp",
           "GET /a/:assetId",
-          "Static assets: everything else (via ASSETS binding)",
+          "GET /debug/wasm",
         ],
-        note: "Make sure wasm files are served at /wasm/*.wasm. SIMD filenames are rewritten to non-simd.",
+        wasmServedFrom: "/wasm/*.wasm (static assets)",
+        build: "instantiateWasm-v1",
       });
     }
 
+    // ---- /upload-url ----
     if (url.pathname === "/upload-url" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         userId?: string;
@@ -294,10 +390,7 @@ export default {
       const mime = body.mime || "application/octet-stream";
       const bytes = body.bytes || 0;
 
-      const userPrefix = (body.userId || "anon").replace(
-        /[^a-zA-Z0-9._-]/g,
-        "_",
-      );
+      const userPrefix = sanitizeUserId(body.userId);
       const sha = (body.sha256 ?? "").trim();
       const fileKey = sha
         ? `staging/${userPrefix}/${sha}`
@@ -325,6 +418,7 @@ export default {
       });
     }
 
+    // ---- /commit ----
     if (url.pathname === "/commit" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         assetId?: string;
@@ -334,12 +428,14 @@ export default {
         format?: OutputFormat;
       };
 
-      if (!body.assetId || !body.r2Key)
+      if (!body.assetId || !body.r2Key) {
         return json({ error: "missing assetId/r2Key" }, 400);
+      }
 
       const original = await env.STAGING.get(body.r2Key);
-      if (!original)
+      if (!original) {
         return json({ error: "object not found in R2 (upload failed?)" }, 404);
+      }
 
       const raw = await env.HOT.get(`asset:${body.assetId}`);
       if (!raw) return json({ error: "assetId not found/expired" }, 404);
@@ -348,8 +444,8 @@ export default {
       const format = pickFormat(req, body);
 
       try {
-        const imageData = await r2ObjectToImageData(env, origin, original);
-        const out = await encodeImage(origin, format, imageData);
+        const imageData = await r2ObjectToImageData(env, original);
+        const out = await encodeImage(env, imageData, format);
 
         const outHash = await sha256HexBytes(out.bytes.buffer);
         const convertedKey = `staging/converted/${outHash}.${out.ext}`;
@@ -361,9 +457,10 @@ export default {
           },
         });
 
-        // Optional: delete the original upload
+        // Optional: delete original to save space
         ctx.waitUntil(env.STAGING.delete(body.r2Key));
 
+        // Update mapping
         hot.r2Key = convertedKey;
         hot.mime = out.mime;
         hot.bytes = out.bytes.byteLength;
@@ -397,6 +494,7 @@ export default {
       }
     }
 
+    // ---- /a/:assetId ----
     {
       const m = url.pathname.match(/^\/a\/(.+)$/);
       if (m && req.method === "GET") {
@@ -419,6 +517,7 @@ export default {
       }
     }
 
+    // ---- Static assets fallback ----
     if (!isApiRoute(url.pathname)) {
       return env.ASSETS.fetch(req);
     }
