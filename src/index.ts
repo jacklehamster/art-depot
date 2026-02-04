@@ -390,13 +390,16 @@ export default {
         url.origin,
       ).toString();
 
+      const orig = (hot.originalMime || "").toLowerCase();
+      const isPng = orig.includes("png");
+
       let resized: Response;
       try {
         resized = await fetch(originalUrl, {
           cf: {
             image: {
               format,
-              quality: format === "avif" ? 45 : 80,
+              quality: format === "avif" ? (isPng ? 70 : 55) : isPng ? 90 : 82,
             },
             cacheTtl: 0,
           } as any,
