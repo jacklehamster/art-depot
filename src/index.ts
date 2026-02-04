@@ -484,6 +484,26 @@ export default {
         );
         headers.set("cache-control", "public, max-age=3600");
 
+        const ext =
+          hot.mime === "image/avif"
+            ? "avif"
+            : hot.mime === "image/webp"
+              ? "webp"
+              : hot.mime === "image/jpeg"
+                ? "jpg"
+                : hot.mime === "image/png"
+                  ? "png"
+                  : "bin";
+
+        const base = assetId.replace(/\.[a-z0-9]+$/i, "");
+        const downloadName = `${base}.${ext}`;
+
+        // Inline means it still displays in the browser, but has a filename when saved.
+        headers.set(
+          "Content-Disposition",
+          `inline; filename="${downloadName}"`,
+        );
+
         return new Response(obj.body, {
           headers,
           cf: { cacheEverything: true, cacheTtl: 3600 } as any,

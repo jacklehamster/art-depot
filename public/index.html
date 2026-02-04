@@ -185,12 +185,11 @@
 
         $("status").textContent = "Done ✅";
         const link = `/a/${encodeURIComponent(init.assetId)}`;
-        const compressedLink = `https://img.dobuki.net?url=${location.origin}${link}`;
 
         const outDiv = document.querySelector("#out");
         outDiv.style.display = "flex";
         outDiv.style.flexDirection = "row";
-        const IMAGES = [link, compressedLink];
+        const IMAGES = [link];
         IMAGES.forEach((url) => {
           const a = outDiv.appendChild(document.createElement("a"));
           a.href = url;
