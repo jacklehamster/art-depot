@@ -169,6 +169,32 @@ function extAndMime(format: OutputFormat) {
     : { ext: "avif", mime: "image/avif" };
 }
 
+/** Sniff only what we need: AVIF / WebP (in case Content-Type is missing on R2 object). */
+function sniffAvifOrWebp(buf: Uint8Array): "image/avif" | "image/webp" | null {
+  // WebP: "RIFF" .... "WEBP"
+  if (
+    buf.length >= 12 &&
+    String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) === "RIFF" &&
+    String.fromCharCode(buf[8], buf[9], buf[10], buf[11]) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  // AVIF: ISO BMFF with "ftyp" at [4..7], brand at [8..11] == "avif" or "avis"
+  if (
+    buf.length >= 16 &&
+    buf[4] === 0x66 &&
+    buf[5] === 0x74 &&
+    buf[6] === 0x79 &&
+    buf[7] === 0x70
+  ) {
+    const brand = String.fromCharCode(buf[8], buf[9], buf[10], buf[11]);
+    if (brand === "avif" || brand === "avis") return "image/avif";
+  }
+
+  return null;
+}
+
 export default {
   async fetch(
     req: Request,
@@ -183,16 +209,16 @@ export default {
         ok: true,
         routes: [
           "POST /upload-url",
-          "POST /commit?format=avif|webp  (converts using Cloudflare Image Resizing, then stores to R2)",
+          "POST /commit?format=avif|webp  (converts using Cloudflare Image Resizing, then stores to R2; skips if already avif/webp)",
           "GET /a/:assetId  (serves converted if committed; otherwise original)",
           "GET /o/:assetId  (serves original; used internally by /commit)",
           "Static assets: everything else (via ASSETS binding)",
         ],
-        note: "This version requires Cloudflare Image Resizing enabled on the zone. No WASM.",
+        note: "Requires Cloudflare Image Resizing enabled on the zone. No WASM.",
       });
     }
 
-    // ---- API: upload-url (unchanged) ----
+    // ---- API: upload-url ----
     if (url.pathname === "/upload-url" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         userId?: string;
@@ -245,7 +271,7 @@ export default {
       });
     }
 
-    // ---- API: serve original by assetId (internal for resize fetch, but also useful) ----
+    // ---- API: serve original by assetId ----
     {
       const m = url.pathname.match(/^\/o\/(.+)$/);
       if (m && req.method === "GET") {
@@ -272,7 +298,7 @@ export default {
       }
     }
 
-    // ---- API: commit (convert + store) ----
+    // ---- API: commit (convert + store; OR skip if already AVIF/WebP) ----
     if (url.pathname === "/commit" && req.method === "POST") {
       const body = (await req.json().catch(() => ({}))) as {
         assetId?: string;
@@ -282,13 +308,15 @@ export default {
         format?: OutputFormat;
       };
 
-      if (!body.assetId || !body.r2Key)
+      if (!body.assetId || !body.r2Key) {
         return json({ error: "missing assetId/r2Key" }, 400);
+      }
 
       // Verify original exists
       const head = await env.STAGING.head(body.r2Key);
-      if (!head)
+      if (!head) {
         return json({ error: "object not found in R2 (upload failed?)" }, 404);
+      }
 
       // Load HOT record
       const raw = await env.HOT.get(`asset:${body.assetId}`);
@@ -298,15 +326,65 @@ export default {
 
       // Keep original pointers stable
       hot.originalKey = hot.originalKey || body.r2Key;
-      hot.originalMime = hot.originalMime || body.mime || hot.mime;
+      hot.originalMime =
+        hot.originalMime ||
+        body.mime ||
+        head.httpMetadata?.contentType ||
+        hot.mime ||
+        "application/octet-stream";
       hot.originalBytes =
         hot.originalBytes || body.bytes || hot.bytes || head.size || 0;
 
+      // If original is already AVIF or WebP, "commit" by pointing to original and skip conversion.
+      let origCT = (hot.originalMime || "").toLowerCase();
+
+      if (!origCT || origCT === "application/octet-stream") {
+        // Sniff magic bytes via a small range fetch from /o/:assetId
+        const originalUrl = new URL(
+          `/o/${encodeURIComponent(body.assetId)}`,
+          url.origin,
+        );
+        const resp = await fetch(originalUrl.toString(), {
+          headers: { Range: "bytes=0-63" },
+        });
+
+        if (resp.ok) {
+          const buf = new Uint8Array(await resp.arrayBuffer());
+          const sniff = sniffAvifOrWebp(buf);
+          if (sniff) origCT = sniff;
+        }
+      }
+
+      if (origCT === "image/avif" || origCT === "image/webp") {
+        hot.r2Key = body.r2Key;
+        hot.mime = origCT;
+        hot.bytes = head.size ?? hot.originalBytes ?? 0;
+
+        await env.HOT.put(`asset:${body.assetId}`, JSON.stringify(hot), {
+          expirationTtl: HOT_TTL_SECONDS,
+        });
+
+        ctx.waitUntil(
+          persistToDrive(env, hot).catch((e) =>
+            console.error("persistToDrive failed", e),
+          ),
+        );
+
+        return json({
+          ok: true,
+          assetId: body.assetId,
+          r2Key: body.r2Key,
+          mime: origCT,
+          bytes: hot.bytes,
+          format: origCT === "image/webp" ? "webp" : "avif",
+          skipped: "already_compressed",
+        });
+      }
+
+      // Otherwise convert via Cloudflare Image Resizing
       const format = pickFormat(req, body);
       const { ext, mime: outMime } = extAndMime(format);
 
-      // Fetch the original THROUGH our own endpoint and ask Cloudflare Image Resizing to transcode it.
-      // This is the key: no WASM, no decoding in JS.
       const originalUrl = new URL(
         `/o/${encodeURIComponent(body.assetId)}`,
         url.origin,
@@ -319,10 +397,7 @@ export default {
             image: {
               format,
               quality: format === "avif" ? 45 : 80,
-              // keep original dimensions; no resize unless you add width/height
-              // width: ..., height: ...,
             },
-            // don't cache the transform at edge; we store it ourselves in R2
             cacheTtl: 0,
           } as any,
         });
@@ -331,7 +406,7 @@ export default {
           {
             error: "resize_fetch_failed",
             message: e instanceof Error ? e.message : String(e),
-            hint: "If this is a Cloudflare zone, ensure Image Resizing is enabled.",
+            hint: "Ensure Cloudflare Image Resizing is enabled.",
           },
           400,
         );
@@ -344,7 +419,7 @@ export default {
             error: "resize_failed",
             status: resized.status,
             body: txt.slice(0, 500),
-            hint: "Cloudflare Image Resizing might not be enabled on this zone, or the input image type is unsupported.",
+            hint: "Image Resizing may be disabled, or the input type is unsupported.",
           },
           400,
         );
@@ -353,7 +428,6 @@ export default {
       const outAb = await resized.arrayBuffer();
       const outBytes = new Uint8Array(outAb);
 
-      // Dedup by converted bytes
       const outHash = await sha256HexBytes(outBytes.buffer);
       const convertedKey = `staging/converted/${outHash}.${ext}`;
 
@@ -363,9 +437,6 @@ export default {
           cacheControl: "public, max-age=31536000, immutable",
         },
       });
-
-      // Optionally delete original to save space:
-      // ctx.waitUntil(env.STAGING.delete(body.r2Key));
 
       // Update HOT to serve converted version via /a/:assetId
       hot.r2Key = convertedKey;
